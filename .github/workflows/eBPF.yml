@@ -74,7 +74,7 @@ jobs:
             TARGET="${{ github.event.inputs.custom_target }}"
           fi
 
-          if [ -z "$TARGET" ] || [[ "$TARGET" != */* ]]; then
+          if [ -z "$TARGET" ] \vert{}\vert{} [[ "$TARGET" != */* ]]; then
             echo "❌ 错误: Target 格式必须为 <target>/<subtarget>，例如 x86/64 或 bcm27xx/bcm2711"
             exit 1
           fi
@@ -94,7 +94,7 @@ jobs:
           fi
 
           echo "正在查询 SDK 目录: ${SDK_BASE_URL}"
-          SDK_FILE=$(curl -fsSL "$SDK_BASE_URL" | grep -oE "${DISTRO}-sdk-[^\"]*Linux-x86_64\.tar\.(zst|xz)" | head -n 1)
+          SDK_FILE=$(curl -fsSL "$SDK_BASE_URL" \vert{} grep -oE "${DISTRO}-sdk-[^\"]*Linux-x86_64\.tar\.(zst|xz)" | head -n 1)
 
           if [ -z "$SDK_FILE" ]; then
             echo "❌ 未能在 ${SDK_BASE_URL} 找到匹配的 SDK 文件，请核对版本号与架构拼写！"
@@ -116,7 +116,6 @@ jobs:
           DEBIAN_FRONTEND: noninteractive
         run: |
           sudo -E apt-get -qq update
-          # 安装 OpenWrt 编译基础依赖 + eBPF 编译必需的 clang / llvm / libelf-dev
           sudo -E apt-get -qq install -y \
             $(curl -fsSL https://raw.githubusercontent.com/nantayo/My-Pkg/master/openwrt) \
             zstd clang llvm libelf-dev pkg-config > /dev/null
@@ -137,157 +136,4 @@ jobs:
           fi
 
           rm -f "${{ steps.meta.outputs.sdk_file }}"
-          SDK_DIR=$(find . -maxdepth 1 -mindepth 1 -type d | head -n 1)
-          mv "$SDK_DIR" openwrt
-
-      - name: Prepare tutuicmptunnel (BPF) OpenWrt Package
-        run: |
-          cd /workdir/openwrt
-
-          # 1. 拉取 BPF 版源码及 libbpf/bpftool 子模块到临时目录，打包为本地源码归档供 OpenWrt 构建系统调用
-          SRC_REF="${{ github.event.inputs.src_ref }}"
-          if [ -n "$SRC_REF" ]; then
-            git clone --recursive --depth 1 -b "$SRC_REF" https://github.com/hrimfaxi/tutuicmptunnel.git /workdir/tutu-src
-          else
-            git clone --recursive --depth 1 https://github.com/hrimfaxi/tutuicmptunnel.git /workdir/tutu-src
-          fi
-
-          mkdir -p dl package/tutuicmptunnel-bpf
-          tar -czf dl/tutuicmptunnel-bpf-src.tar.gz -C /workdir tutu-src
-
-          XDP_FLAG="0"
-          if [ "${{ github.event.inputs.enable_xdp }}" = "true" ]; then
-            XDP_FLAG="1"
-          fi
-
-          # 2. 生成 OpenWrt Package Makefile（包含用户态 BPF 加载器与内核态 tutu_csum_fixup.ko）
-          cat << 'EOF' > package/tutuicmptunnel-bpf/Makefile
-          include $(TOPDIR)/rules.mk
-          include $(INCLUDE_DIR)/kernel.mk
-
-          PKG_NAME:=tutuicmptunnel-bpf
-          PKG_VERSION:=1.7
-          PKG_RELEASE:=1
-
-          PKG_SOURCE:=tutuicmptunnel-bpf-src.tar.gz
-          PKG_BUILD_DIR:=$(BUILD_DIR)/tutu-src
-          PKG_LICENSE:=GPL-2.0-or-later
-
-          include $(INCLUDE_DIR)/package.mk
-          include $(INCLUDE_DIR)/cmake.mk
-
-          CMAKE_OPTIONS += \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DENABLE_HARDEN_MODE=1 \
-            -DUSE_SYSTEM_LIBBPF_BPFTOOL=0 \
-            -DENABLE_XDP_INGRESS=__XDP_FLAG__
-
-          define Package/tutuicmptunnel-bpf
-            SECTION:=net
-            CATEGORY:=Network
-            TITLE:=eBPF-based UDP-to-ICMP protocol morpher
-            DEPENDS:=+libelf +zlib +kmod-sched-bpf +kmod-tutu-csum-fixup
-          endef
-
-          define KernelPackage/tutu-csum-fixup
-            SUBMENU:=Network Support
-            TITLE:=Checksum fixup kernel module for tutuicmptunnel eBPF
-            FILES:=$(PKG_BUILD_DIR)/tutu_csum_fixup/tutu_csum_fixup.ko
-            AUTOLOAD:=$(call AutoProbe,tutu_csum_fixup)
-          endef
-
-          define Build/Compile
-          	$(call Build/Compile/Default)
-          	if [ -d "$(PKG_BUILD_DIR)/tutu_csum_fixup" ]; then \
-          		$(KERNEL_MAKE) M="$(PKG_BUILD_DIR)/tutu_csum_fixup" modules; \
-          	fi
-          endef
-
-          define Package/tutuicmptunnel-bpf/install
-          	$(INSTALL_DIR) $(1)/usr/bin
-          	find $(PKG_BUILD_DIR) -maxdepth 2 -type f -executable \( -name "tuctl*" -o -name "tuserver*" \) -exec $(INSTALL_BIN) {} $(1)/usr/bin/ \;
-          endef
-
-          $(eval $(call BuildPackage,tutuicmptunnel-bpf))
-          $(eval $(call KernelPackage,tutu-csum-fixup))
-          EOF
-
-          # 去除前导缩进并替换 XDP 开关
-          sed -i 's/^          //' package/tutuicmptunnel-bpf/Makefile
-          sed -i "s/__XDP_FLAG__/${XDP_FLAG}/g" package/tutuicmptunnel-bpf/Makefile
-
-          # 3. 更新 feeds 并生成配置
-          ./scripts/feeds update base packages
-          ./scripts/feeds install libelf zlib
-
-          make defconfig
-          sed -i 's/^# \(CONFIG_PACKAGE_.*tutu.*\) is not set/\1=m/' .config
-          make defconfig
-
-          echo "=== 已选中的 tutuicmptunnel-bpf 配置项 ==="
-          grep -i "tutu" .config || true
-
-      - name: Compile tutuicmptunnel-bpf
-        run: |
-          cd /workdir/openwrt
-
-          make package/tutuicmptunnel-bpf/clean V=s
-          KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" \
-            make package/tutuicmptunnel-bpf/compile V=s
-
-          mkdir -p /workdir/release_files /workdir/pkg_extract
-          find bin/ -type f \( -name "*tutu*.ipk" -o -name "*tutu*.apk" \) -exec cp -v {} /workdir/release_files/ \;
-
-          # 提取 .apk 中的 .ko 与二进制文件 (适用于 OpenWrt / ImmortalWrt 25.12+ / Snapshot)
-          APK_BIN=$(find /workdir/openwrt/staging_dir/host/ -name "apk" -type f -executable 2>/dev/null | head -n 1)
-          if [ -n "$APK_BIN" ] && ls /workdir/release_files/*.apk >/dev/null 2>&1; then
-            cd /workdir/pkg_extract
-            for f in /workdir/release_files/*.apk; do
-              "$APK_BIN" extract --allow-untrusted "$f"
-            done
-          fi
-
-          # 提取 .ipk 中的 .ko 与二进制文件 (适用于 OpenWrt / ImmortalWrt 24.10 及更早版本)
-          if ls /workdir/release_files/*.ipk >/dev/null 2>&1; then
-            cd /workdir/pkg_extract
-            for f in /workdir/release_files/*.ipk; do
-              mkdir -p tmp_ipk
-              tar -xzf "$f" -C tmp_ipk
-              tar -xzf tmp_ipk/data.tar.gz -C /workdir/pkg_extract
-              rm -rf tmp_ipk
-            done
-          fi
-
-          # 收集提取出来的内核模块与用户态可执行文件
-          find /workdir/pkg_extract -name "*.ko" -exec cp -v {} /workdir/release_files/ \;
-          find /workdir/pkg_extract -path "*/usr/bin/*" -type f -exec cp -v {} /workdir/release_files/ \;
-          find /workdir/pkg_extract -path "*/usr/sbin/*" -type f -exec cp -v {} /workdir/release_files/ \;
-
-          echo "=== 最终输出文件列表 ==="
-          ls -lh /workdir/release_files/
-
-      - name: Check output files
-        id: tag
-        run: |
-          if [ -n "$(ls -A /workdir/release_files 2>/dev/null)" ]; then
-            echo "status=success" >> $GITHUB_OUTPUT
-          else
-            echo "❌ 未找到编译产物 (.ipk / .apk)!"
-            exit 1
-          fi
-
-      - name: Upload Package to release
-        uses: softprops/action-gh-release@v2
-        if: steps.tag.outputs.status == 'success' && github.event.inputs.upload_release != false && !cancelled()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ steps.meta.outputs.release_tag }}
-          name: ${{ steps.meta.outputs.release_tag }}
-          body: |
-            - **Mode**: `eBPF` (XDP Ingress: `${{ github.event.inputs.enable_xdp || false }}`)
-            - **Distro**: `${{ github.event.inputs.distro || 'immortalwrt' }}`
-            - **Version**: `${{ github.event.inputs.version || '25.12.0' }}`
-            - **Target**: `${{ github.event.inputs.target == 'custom' && github.event.inputs.custom_target || (github.event.inputs.target || 'qualcommax/ipq807x') }}`
-            - **SDK**: `${{ steps.meta.outputs.sdk_file }}`
-          files: /workdir/release_files/*
+          SDK_DIR=$(find . -maxdepth 1 -mindepth 1 -type d | head -n
