@@ -191,8 +191,8 @@ jobs:
           # 验证 libelf.h 已就绪
           ls -la "${TARGET_DIR}/usr/include/libelf.h"
 
-          SYSROOT_FLAGS="--sysroot=${TOOLCHAIN_DIR} -I${TARGET_DIR}/usr/include -I${TOOLCHAIN_DIR}/include"
-          LDFLAGS_FLAGS="--sysroot=${TOOLCHAIN_DIR} -L${TARGET_DIR}/usr/lib -L${TOOLCHAIN_DIR}/lib"
+          SYSROOT_FLAGS="--sysroot=${TOOLCHAIN_DIR} -I${TARGET_DIR}/usr/include -I${TOOLCHAIN_DIR}/include -fPIC"
+          LDFLAGS_FLAGS="--sysroot=${TOOLCHAIN_DIR} -L${TARGET_DIR}/usr/lib -L${TOOLCHAIN_DIR}/lib -no-pie"
 
           XDP_FLAG="0"
           [ "${{ github.event.inputs.enable_xdp }}" = "true" ] && XDP_FLAG="1"
