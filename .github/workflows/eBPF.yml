@@ -243,7 +243,9 @@ jobs:
             cp -v /workdir/tutuicmptunnel/tutu_csum_fixup/*.ko /workdir/release_files/
           fi
 
-          tar -czf "/workdir/release_files/${{ steps.meta.outputs.release_tag }}.tar.gz" -C /workdir/release_files .
+          # 先打包到 /workdir 再移入 release_files，避免 tar 报 file changed as we read it
+          tar -czf "/workdir/${{ steps.meta.outputs.release_tag }}.tar.gz" -C /workdir/release_files .
+          mv "/workdir/${{ steps.meta.outputs.release_tag }}.tar.gz" /workdir/release_files/
 
           echo "=== 最终输出产物 ==="
           ls -lh /workdir/release_files/
