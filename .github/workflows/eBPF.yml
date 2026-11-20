@@ -180,6 +180,17 @@ jobs:
           export STAGING_DIR="$TARGET_DIR"
           export PATH="${TOOLCHAIN_DIR}/bin:${PATH}"
 
+          # 1.5 使用 OpenWrt SDK 编译目标架构的 zlib 和 libelf (elfutils)，生成 libelf.h 到 TARGET_DIR/usr/include
+          cd /workdir/openwrt
+          ./scripts/feeds update base packages
+          ./scripts/feeds install libelf zlib
+          make defconfig
+          make package/zlib/compile -j$(nproc) || make package/libs/zlib/compile -j$(nproc)
+          make package/elfutils/compile -j$(nproc) || make package/libs/elfutils/compile -j$(nproc)
+
+          # 验证 libelf.h 已就绪
+          ls -la "${TARGET_DIR}/usr/include/libelf.h"
+
           SYSROOT_FLAGS="--sysroot=${TOOLCHAIN_DIR} -I${TARGET_DIR}/usr/include -I${TOOLCHAIN_DIR}/include"
           LDFLAGS_FLAGS="--sysroot=${TOOLCHAIN_DIR} -L${TARGET_DIR}/usr/lib -L${TOOLCHAIN_DIR}/lib"
 
