@@ -131,30 +131,34 @@ jobs:
           ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
       - name: Load and select tutuicmptunnel
+        id: pkg
         run: |
-          # 直接复制当前仓库（openwrt-tutuicmptunnel-kmod）到 SDK 的 package 目录
-          cp -r $GITHUB_WORKSPACE/pkg_repo /workdir/openwrt/package/tutuicmptunnel
+          echo "=== 检查仓库目录结构 ==="
+          ls -la $GITHUB_WORKSPACE/pkg_repo
 
           cd /workdir/openwrt
-          # 更新 feeds 并安装完整包索引，避免依赖缺失导致包被 defconfig 隐藏
+
+          # 1. 将当前仓库作为本地自定义 feed 挂载（兼容根目录 Makefile 或子目录多包结构）
+          cp feeds.conf.default feeds.conf
+          echo "src-link custom $GITHUB_WORKSPACE/pkg_repo" >> feeds.conf
+
+          # 2. 更新 feeds，仅按需安装 libmnl 和 custom feed（避免全量 install -a 触发无关的 Kconfig 循环依赖警告）
           ./scripts/feeds update -a
-          ./scripts/feeds install -a
+          ./scripts/feeds install libmnl
+          ./scripts/feeds install -p custom -a
 
-          # 1. 生成默认 .config 并刷新包索引
-          make defconfig
-
-          # 2. 打印包索引中的真实包名用于核对
-          echo "=== 包索引中的定义 ==="
-          grep -i -C 3 "tutu" tmp/.config-package.in || true
-
-          # 3. 兼容未选中状态 (# CONFIG_... is not set) 设为 =m
-          sed -i 's/^# \(CONFIG_PACKAGE_.*tutu.*\) is not set/\1=m/' .config
-          if ! grep -q "CONFIG_PACKAGE_.*tutu" .config; then
-            echo "CONFIG_PACKAGE_kmod-tutuicmptunnel=m" >> .config
-            echo "CONFIG_PACKAGE_tutuicmptunnel=m" >> .config
+          # 3. 自动获取挂载到 package/feeds/custom/ 下的真实构建路径
+          PKG_MAKE_PATH=$(find package/feeds/custom -maxdepth 2 -name "Makefile" -printf "%h\n" | head -n 1)
+          if [ -z "$PKG_MAKE_PATH" ]; then
+            echo "❌ 未在 custom feed 中找到有效的 OpenWrt Makefile！"
+            exit 1
           fi
+          echo "pkg_path=${PKG_MAKE_PATH}" >> $GITHUB_OUTPUT
+          echo "✅ 解析到构建路径: ${PKG_MAKE_PATH}"
 
-          # 4. 再次运行 defconfig 自动解析并选中依赖
+          # 4. 生成默认 .config 并启用所有 tutuicmptunnel 相关包 (=m)
+          make defconfig
+          sed -i 's/^# \(CONFIG_PACKAGE_.*tutu.*\) is not set/\1=m/' .config
           make defconfig
 
           echo "=== 已选中的 tutuicmptunnel 配置项 ==="
@@ -164,13 +168,12 @@ jobs:
         run: |
           cd /workdir/openwrt
 
-          # 清理旧缓存并强制以模块形式编译
-          make package/tutuicmptunnel/clean V=s
+          PKG_PATH="${{ steps.pkg.outputs.pkg_path }}"
+          echo "开始编译: ${PKG_PATH}"
+
+          make "${PKG_PATH}/clean" V=s
           KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" \
-            make package/tutuicmptunnel/compile \
-            CONFIG_PACKAGE_kmod-tutuicmptunnel=m \
-            CONFIG_PACKAGE_tutuicmptunnel=m \
-            V=s
+            make "${PKG_PATH}/compile" V=s
 
           mkdir -p /workdir/release_files /workdir/pkg_extract
           find bin/ -type f \( -name "*tutu*.ipk" -o -name "*tutu*.apk" \) -exec cp -v {} /workdir/release_files/ \;
