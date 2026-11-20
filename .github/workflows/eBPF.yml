@@ -121,7 +121,7 @@ jobs:
           sudo -E apt-get -qq update
           sudo -E apt-get -qq install -y \
             $(curl -fsSL https://raw.githubusercontent.com/nantayo/My-Pkg/master/openwrt) \
-            zstd clang llvm libelf-dev zlib1g-dev pkg-config cmake make > /dev/null
+            zstd clang llvm libelf-dev zlib1g-dev libzstd-dev pkg-config cmake make > /dev/null
           sudo timedatectl set-timezone "$TZ"
           sudo mkdir -p /workdir
           sudo chown $USER:$GROUPS /workdir
@@ -140,7 +140,7 @@ jobs:
             break
           done
 
-      - name: Clone tutuicmptunnel & read official docs/openwrt.md
+      - name: Clone tutuicmptunnel
         working-directory: /workdir
         run: |
           SRC_REF="${{ github.event.inputs.src_ref }}"
@@ -150,16 +150,9 @@ jobs:
             git clone --recursive --depth 1 https://github.com/hrimfaxi/tutuicmptunnel.git tutuicmptunnel
           fi
 
-          echo "=== 官方 docs/openwrt.md 内容 ==="
-          cat tutuicmptunnel/docs/openwrt.md || true
-
-      - name: Cross-compile user-space & kernel module (Official Guide Way)
+      - name: Cross-compile user-space, libsodium & kernel module
         working-directory: /workdir
         run: |
-          # 补充安装宿主机 libzstd-dev（满足宿主机 bpftool 链接 libelf 依赖）
-          sudo apt-get -qq install -y libzstd-dev > /dev/null
-
-          # 1. 定位 OpenWrt SDK 交叉编译工具链与内核源码目录
           TOOLCHAIN_DIR=$(find /workdir/openwrt/staging_dir -maxdepth 1 -type d -name "toolchain-*" | head -n 1)
           TARGET_DIR=$(find /workdir/openwrt/staging_dir -maxdepth 1 -type d -name "target-*" | head -n 1)
           LINUX_DIR=$(find /workdir/openwrt/build_dir -maxdepth 3 -type d -name "linux-[0-9]*" | head -n 1)
@@ -180,16 +173,14 @@ jobs:
           export STAGING_DIR="$TARGET_DIR"
           export PATH="${TOOLCHAIN_DIR}/bin:${PATH}"
 
-          # 1.5 使用 OpenWrt SDK 编译目标架构的 zlib 和 libelf (elfutils)，生成 libelf.h 到 TARGET_DIR/usr/include
+          # 1. 使用 OpenWrt SDK 编译目标架构的 zlib、libelf 以及文档所需的 libsodium.so
           cd /workdir/openwrt
           ./scripts/feeds update base packages
-          ./scripts/feeds install libelf zlib
+          ./scripts/feeds install libelf zlib libsodium
           make defconfig
           make package/zlib/compile -j$(nproc) || make package/libs/zlib/compile -j$(nproc)
           make package/elfutils/compile -j$(nproc) || make package/libs/elfutils/compile -j$(nproc)
-
-          # 验证 libelf.h 已就绪
-          ls -la "${TARGET_DIR}/usr/include/libelf.h"
+          make package/libsodium/compile -j$(nproc) || make package/libs/libsodium/compile -j$(nproc)
 
           SYSROOT_FLAGS="--sysroot=${TOOLCHAIN_DIR} -I${TARGET_DIR}/usr/include -I${TOOLCHAIN_DIR}/include -fPIC"
           LDFLAGS_FLAGS="--sysroot=${TOOLCHAIN_DIR} -L${TARGET_DIR}/usr/lib -L${TOOLCHAIN_DIR}/lib -no-pie"
@@ -197,7 +188,7 @@ jobs:
           XDP_FLAG="0"
           [ "${{ github.event.inputs.enable_xdp }}" = "true" ] && XDP_FLAG="1"
 
-          mkdir -p /workdir/tutuicmptunnel/build /workdir/release_files
+          mkdir -p /workdir/tutuicmptunnel/build /workdir/release_files /workdir/install_stage
           cd /workdir/tutuicmptunnel/build
 
           cmake .. \
@@ -206,6 +197,7 @@ jobs:
             -DCMAKE_C_COMPILER="${CROSS_PREFIX}gcc" \
             -DCMAKE_CXX_COMPILER="${CROSS_PREFIX}g++" \
             -DCMAKE_SYSROOT="${TOOLCHAIN_DIR}" \
+            -DCMAKE_INSTALL_PREFIX=/usr \
             -DCMAKE_C_FLAGS="${SYSROOT_FLAGS}" \
             -DCMAKE_CXX_FLAGS="${SYSROOT_FLAGS}" \
             -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS_FLAGS}" \
@@ -219,36 +211,43 @@ jobs:
             -DDISABLE_BPF_TIMER=0 \
             -DENABLE_XDP_INGRESS="$XDP_FLAG"
 
-          # 2. 阶段一：纯宿主机环境单独编译 bpftool（不传交叉编译 EXTRA_* 参数）
           make -j$(nproc) build_bpftool
-
-          # 3. 阶段二：带目标机 musl sysroot 参数编译 libbpf 与用户态程序
           make -j$(nproc) EXTRA_CFLAGS="${SYSROOT_FLAGS}" EXTRA_LDFLAGS="${LDFLAGS_FLAGS}"
 
-          # 4. 收集并 strip 用户态二进制文件
-          for bin in tuctl tuctl_client tuctl_server tuserver; do
-            if [ -f "$bin" ]; then
-              "${CROSS_PREFIX}strip" "$bin" || true
-              cp -v "$bin" /workdir/release_files/
-            fi
+          # 2. 提取全部 tuctl* / tuserver* 用户态二进制文件（同时覆盖 CMake 安装目录与子构建目录）
+          DESTDIR=/workdir/install_stage cmake --install . || true
+          find /workdir/install_stage /workdir/tutuicmptunnel/build \
+            -not -path "*/CMakeFiles/*" \
+            -type f -executable \( -name "tuctl*" -o -name "tuserver*" \) | while read -r bin; do
+            "${CROSS_PREFIX}strip" "$bin" 2>/dev/null || true
+            cp -vf "$bin" /workdir/release_files/
           done
 
-          # 5. 针对目标 SDK 内核树独立编译 tutu_csum_fixup.ko
+          # 3. 提取目标架构的 libsodium.so 动态库（同时拷贝真实 .so 文件与 libsodium.so 软链接/副本）
+          find "${TARGET_DIR}/usr/lib" /workdir/openwrt/build_dir -name "libsodium.so*" -type f | while read -r sofile; do
+            "${CROSS_PREFIX}strip" --strip-unneeded "$sofile" 2>/dev/null || true
+            cp -vf "$sofile" /workdir/release_files/
+            # 确保同时存在名为 libsodium.so 的直接可用文件
+            cp -vf "$sofile" /workdir/release_files/libsodium.so
+          done
+
+          # 4. 独立编译目标内核的 tutu_csum_fixup.ko
           if [ -d "/workdir/tutuicmptunnel/tutu_csum_fixup" ] && [ -n "$LINUX_DIR" ]; then
             make -C "$LINUX_DIR" \
               ARCH="$KARCH" \
               CROSS_COMPILE="$CROSS_PREFIX" \
               M="/workdir/tutuicmptunnel/tutu_csum_fixup" \
               modules
-            cp -v /workdir/tutuicmptunnel/tutu_csum_fixup/*.ko /workdir/release_files/
+            cp -vf /workdir/tutuicmptunnel/tutu_csum_fixup/*.ko /workdir/release_files/
           fi
 
-          # 先打包到 /workdir 再移入 release_files，避免 tar 报 file changed as we read it
+          # 5. 生成完整离线部署包
           tar -czf "/workdir/${{ steps.meta.outputs.release_tag }}.tar.gz" -C /workdir/release_files .
           mv "/workdir/${{ steps.meta.outputs.release_tag }}.tar.gz" /workdir/release_files/
 
-          echo "=== 最终输出产物 ==="
+          echo "=== 最终输出产物及架构校验 ==="
           ls -lh /workdir/release_files/
+          file /workdir/release_files/* || true
 
       - name: Check output files
         id: tag
