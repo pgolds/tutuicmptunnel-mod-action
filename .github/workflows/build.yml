@@ -50,6 +50,9 @@ on:
 env:
   TZ: Asia/Shanghai
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-24.04
