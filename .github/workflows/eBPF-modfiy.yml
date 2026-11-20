@@ -1,4 +1,4 @@
-name: Build tutuicmptunnel (Official OpenWrt Guide)
+name: Build tutuicmptunnel (eBPF - remote BTF OpenWrt Guide)
 
 on:
   repository_dispatch:
