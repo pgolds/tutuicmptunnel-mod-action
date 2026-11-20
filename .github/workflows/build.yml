@@ -36,6 +36,11 @@ on:
         required: false
         type: string
         default: ''
+      pkg_ref:
+        description: 'openwrt-tutuicmptunnel-kmod 分支或 Tag'
+        required: false
+        type: string
+        default: 'master'
       upload_release:
         description: '自动上传到 GitHub Release'
         required: false
@@ -50,11 +55,6 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout openwrt-tutuicmptunnel-kmod
-        uses: actions/checkout@v4
-        with:
-          path: pkg_repo
-
       - name: Resolve build parameters & SDK URL
         id: meta
         run: |
@@ -128,46 +128,37 @@ jobs:
           rm -f "${{ steps.meta.outputs.sdk_file }}"
           SDK_DIR=$(find . -maxdepth 1 -mindepth 1 -type d | head -n 1)
           mv "$SDK_DIR" openwrt
-          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-      - name: Load and select tutuicmptunnel
-        id: pkg
+      - name: Clone and select tutuicmptunnel
         run: |
-          # 1. 打印仓库 Makefile 前 20 行确认 PKG_NAME 与真实结构
-          echo "=== 仓库 Makefile 头部信息 ==="
-          head -n 20 $GITHUB_WORKSPACE/pkg_repo/Makefile
-
-          # 2. 直接拷贝到原生 package/ 目录下（不走 feeds 软链接）
-          mkdir -p /workdir/openwrt/package/custom/tutuicmptunnel-kmod
-          cp -r $GITHUB_WORKSPACE/pkg_repo/* /workdir/openwrt/package/custom/tutuicmptunnel-kmod/
-
           cd /workdir/openwrt
+
+          # 直接从 GitHub 克隆 openwrt-tutuicmptunnel-kmod 源码到 package/tutuicmptunnel
+          git clone --depth 1 -b "${{ github.event.inputs.pkg_ref || 'master' }}" \
+            https://github.com/hrimfaxi/openwrt-tutuicmptunnel-kmod.git package/tutuicmptunnel
+
+          echo "=== 确认 package/tutuicmptunnel 内容 ==="
+          ls -la package/tutuicmptunnel
+
+          # 更新基础 feeds 并安装 libmnl
           ./scripts/feeds update base packages
           ./scripts/feeds install libmnl
 
-          # 3. 刷新包索引并生成默认 .config
+          # 生成默认 .config 并启用所有 tutuicmptunnel 相关包 (=m)
           make defconfig
-
-          # 4. 启用所有 tutuicmptunnel 相关包 (=m)
           sed -i 's/^# \(CONFIG_PACKAGE_.*tutu.*\) is not set/\1=m/' .config
           make defconfig
 
           echo "=== 已选中的 tutuicmptunnel 配置项 ==="
           grep -i "tutu" .config || true
 
-          # 5. 传递固定原生路径给下一步
-          echo "pkg_path=package/custom/tutuicmptunnel-kmod" >> $GITHUB_OUTPUT
-
       - name: Compile tutuicmptunnel
         run: |
           cd /workdir/openwrt
 
-          PKG_PATH="${{ steps.pkg.outputs.pkg_path }}"
-          echo "开始编译: ${PKG_PATH}"
-
-          make "${PKG_PATH}/clean" V=s
+          make package/tutuicmptunnel/clean V=s
           KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" \
-            make "${PKG_PATH}/compile" V=s
+            make package/tutuicmptunnel/compile V=s
 
           mkdir -p /workdir/release_files /workdir/pkg_extract
           find bin/ -type f \( -name "*tutu*.ipk" -o -name "*tutu*.apk" \) -exec cp -v {} /workdir/release_files/ \;
