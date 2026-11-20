@@ -215,6 +215,16 @@ jobs:
           make -j$(nproc) build_bpftool
           make -j$(nproc) EXTRA_CFLAGS="${SYSROOT_FLAGS}" EXTRA_LDFLAGS="${LDFLAGS_FLAGS}"
 
+          # 1. 找到所有编出来的 .bpf.o，彻底剥离 .BTF 和 .BTF.ext 段
+          find /workdir/tutuicmptunnel -name "*.bpf.o" | while read -r bpfobj; do
+            echo "Stripping BTF from $bpfobj"
+            llvm-objcopy --remove-section .BTF --remove-section .BTF.ext "$bpfobj"
+          done
+
+          # 2. 删除已生成的 .skel.h，强制 CMake/Make 基于无 BTF 的 .bpf.o 重新生成骨架头文件并链接 tuctl
+          find /workdir/tutuicmptunnel -name "*.skel.h" -delete
+          make -j$(nproc) EXTRA_CFLAGS="${SYSROOT_FLAGS}" EXTRA_LDFLAGS="${LDFLAGS_FLAGS}"
+
           # 2. 提取全部 tuctl* / tuserver* 用户态二进制文件（同时覆盖 CMake 安装目录与子构建目录）
           DESTDIR=/workdir/install_stage cmake --install . || true
           find /workdir/install_stage /workdir/tutuicmptunnel/build \
