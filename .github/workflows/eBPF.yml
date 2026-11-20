@@ -181,22 +181,35 @@ jobs:
           make package/elfutils/compile -j$(nproc) || make package/libs/elfutils/compile -j$(nproc)
           make package/libsodium/compile -j$(nproc) || make package/libs/libsodium/compile -j$(nproc)
 
-          # 关键补丁：修改内置 libbpf 源码，在缺少 /sys/kernel/btf/vmlinux 的无 BTF 内核上跳过 vmlinux BTF 加载而非报 -ESRCH
+          # 关键补丁：在无 BTF 内核上跳过 vmlinux BTF 加载，并清空 btf_ext 避免 CO-RE 空指针解引用导致 Segfault
           python3 -c '
           path = "/workdir/tutuicmptunnel/libbpf/src/libbpf.c"
           with open(path, "r") as f:
               code = f.read()
-          target = "int bpf_object__load_vmlinux_btf(struct bpf_object *obj, bool force)"
-          idx = code.find(target)
-          if idx != -1:
-              brace = code.find("{", idx)
-              patch = "\n\tif (!force && access(\"/sys/kernel/btf/vmlinux\", F_OK) != 0) { obj->btf_vmlinux = NULL; return 0; }\n"
-              code = code[:brace+1] + patch + code[brace+1:]
-              with open(path, "w") as f:
-                  f.write(code)
-              print("✅ 已成功为内置 libbpf 打上无 BTF 内核兼容补丁")
+
+          # 1. 跳过 vmlinux BTF 加载，并同步释放/置空 btf_ext 防止触发 CO-RE 重定位空指针崩溃
+          t1 = "int bpf_object__load_vmlinux_btf(struct bpf_object *obj, bool force)"
+          i1 = code.find(t1)
+          if i1 != -1:
+              b1 = code.find("{", i1)
+              p1 = """
+          \tif (!force && access("/sys/kernel/btf/vmlinux", F_OK) != 0) {
+          \t\tobj->btf_vmlinux = NULL;
+          \t\tif (obj->btf_ext) {
+          \t\t\tbtf_ext__free(obj->btf_ext);
+          \t\t\tobj->btf_ext = NULL;
+          \t\t}
+          \t\treturn 0;
+          \t}
+          """
+              code = code[:b1+1] + p1 + code[b1+1:]
+              print("✅ 已打补丁: bpf_object__load_vmlinux_btf (含 btf_ext 清理)")
           else:
-              print("⚠️ 未找到目标函数，请检查 libbpf 版本")
+              print("❌ 未找到 bpf_object__load_vmlinux_btf")
+              exit(1)
+
+          with open(path, "w") as f:
+              f.write(code)
           '
 
           SYSROOT_FLAGS="--sysroot=${TOOLCHAIN_DIR} -I${TARGET_DIR}/usr/include -I${TOOLCHAIN_DIR}/include -fPIC"
