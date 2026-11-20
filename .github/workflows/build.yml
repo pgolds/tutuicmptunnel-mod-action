@@ -133,30 +133,31 @@ jobs:
       - name: Load and select tutuicmptunnel
         id: pkg
         run: |
-          echo "=== 检查仓库目录结构 ==="
-          ls -la $GITHUB_WORKSPACE/pkg_repo
+          # 1. 创建符合 OpenWrt feed 规范的层级目录: <feed根目录>/<包目录名>/Makefile
+          mkdir -p /workdir/custom_feed/tutuicmptunnel-kmod
+          cp -r $GITHUB_WORKSPACE/pkg_repo/* /workdir/custom_feed/tutuicmptunnel-kmod/
 
           cd /workdir/openwrt
 
-          # 1. 将当前仓库作为本地自定义 feed 挂载（兼容根目录 Makefile 或子目录多包结构）
+          # 2. 挂载本地自定义 feed
           cp feeds.conf.default feeds.conf
-          echo "src-link custom $GITHUB_WORKSPACE/pkg_repo" >> feeds.conf
+          echo "src-link custom /workdir/custom_feed" >> feeds.conf
 
-          # 2. 更新 feeds，仅按需安装 libmnl 和 custom feed（避免全量 install -a 触发无关的 Kconfig 循环依赖警告）
+          # 3. 更新并安装依赖与自定义包
           ./scripts/feeds update -a
           ./scripts/feeds install libmnl
           ./scripts/feeds install -p custom -a
 
-          # 3. 自动获取挂载到 package/feeds/custom/ 下的真实构建路径
-          PKG_MAKE_PATH=$(find package/feeds/custom -maxdepth 2 -name "Makefile" -printf "%h\n" | head -n 1)
-          if [ -z "$PKG_MAKE_PATH" ]; then
-            echo "❌ 未在 custom feed 中找到有效的 OpenWrt Makefile！"
+          # 4. 校验并输出构建路径
+          PKG_MAKE_PATH="package/feeds/custom/tutuicmptunnel-kmod"
+          if [ ! -f "${PKG_MAKE_PATH}/Makefile" ]; then
+            echo "❌ 未找到 ${PKG_MAKE_PATH}/Makefile"
             exit 1
           fi
           echo "pkg_path=${PKG_MAKE_PATH}" >> $GITHUB_OUTPUT
           echo "✅ 解析到构建路径: ${PKG_MAKE_PATH}"
 
-          # 4. 生成默认 .config 并启用所有 tutuicmptunnel 相关包 (=m)
+          # 5. 生成默认 .config 并启用所有 tutuicmptunnel 相关包 (=m)
           make defconfig
           sed -i 's/^# \(CONFIG_PACKAGE_.*tutu.*\) is not set/\1=m/' .config
           make defconfig
