@@ -1,4 +1,4 @@
-name: Build tutuicmptunnel (eBPF OpenWrt)
+name: Build tutuicmptunnel (eBPF Modify OpenWrt)
 
 on:
   repository_dispatch:
