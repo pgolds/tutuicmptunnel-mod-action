@@ -1,0 +1,279 @@
+name: Build tutuicmptunnel (Official OpenWrt Guide - Clean BTF)
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      distro:
+        description: '固件发行版 (OpenWrt / ImmortalWrt)'
+        required: true
+        type: choice
+        default: 'immortalwrt'
+        options:
+          - immortalwrt
+          - openwrt
+      version:
+        description: '固件版本号 (如: 25.12.0, 24.10.1, 24.10.0 或 SNAPSHOT)'
+        required: true
+        type: string
+        default: '25.12.0'
+      target:
+        description: '目标架构 (选 custom 时读取下方自定义架构)'
+        required: true
+        type: choice
+        default: 'qualcommax/ipq807x'
+        options:
+          - qualcommax/ipq807x
+          - qualcommax/ipq60xx
+          - mediatek/filogic
+          - mediatek/mt7622
+          - rockchip/armv8
+          - x86/64
+          - ramips/mt7621
+          - custom
+      custom_target:
+        description: '自定义 Target/Subtarget (仅当上方选 custom 时生效，如 bcm27xx/bcm2711)'
+        required: false
+        type: string
+        default: ''
+      src_ref:
+        description: 'tutuicmptunnel 源码分支或 Tag (留空拉取默认分支)'
+        required: false
+        type: string
+        default: ''
+      enable_xdp:
+        description: '开启 XDP Ingress 模式 (tcpdump 仅可见还原后的 UDP)'
+        required: false
+        type: boolean
+        default: false
+      upload_release:
+        description: '自动上传到 GitHub Release'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  TZ: Asia/Shanghai
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Resolve build parameters & SDK URL
+        id: meta
+        run: |
+          DISTRO="${{ github.event.inputs.distro }}"
+          VERSION="${{ github.event.inputs.version }}"
+          TARGET="${{ github.event.inputs.target }}"
+
+          [ -z "$DISTRO" ] && DISTRO="immortalwrt"
+          [ -z "$VERSION" ] && VERSION="25.12.0"
+          [ -z "$TARGET" ] && TARGET="qualcommax/ipq807x"
+
+          if [ "$TARGET" = "custom" ]; then
+            TARGET="${{ github.event.inputs.custom_target }}"
+          fi
+
+          case "$TARGET" in
+            */*) ;;
+            *)
+              echo "❌ 错误: Target 格式必须为 <target>/<subtarget>，例如 x86/64 或 bcm27xx/bcm2711"
+              exit 1
+              ;;
+          esac
+
+          if [ "$DISTRO" = "immortalwrt" ]; then
+            BASE_HOST="https://downloads.immortalwrt.org"
+          else
+            BASE_HOST="https://downloads.openwrt.org"
+          fi
+
+          if [ "$VERSION" = "SNAPSHOT" ] || [ "$VERSION" = "snapshot" ]; then
+            SDK_BASE_URL="${BASE_HOST}/snapshots/targets/${TARGET}/"
+            VER_TAG="snapshot"
+          else
+            SDK_BASE_URL="${BASE_HOST}/releases/${VERSION}/targets/${TARGET}/"
+            VER_TAG="${VERSION}"
+          fi
+
+          SDK_FILE=$(curl -fsSLg "$SDK_BASE_URL" | sed -n "s/.*href=\"\(${DISTRO}-sdk-[^\"]*Linux-x86_64\.tar\.[xzst]*\)\".*/\1/p" | head -n 1)
+
+          if [ -z "$SDK_FILE" ]; then
+            echo "❌ 未能在 ${SDK_BASE_URL} 找到匹配的 SDK 文件！"
+            exit 1
+          fi
+
+          SAFE_TARGET=$(echo "$TARGET" | tr '/' '-')
+          RELEASE_TAG="${DISTRO}-${VER_TAG}-${SAFE_TARGET}-tutuicmptunnel-bpf"
+
+          echo "sdk_url=${SDK_BASE_URL}${SDK_FILE}" >> $GITHUB_OUTPUT
+          echo "sdk_file=${SDK_FILE}" >> $GITHUB_OUTPUT
+          echo "release_tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install -y \
+            $(curl -fsSL https://raw.githubusercontent.com/nantayo/My-Pkg/master/openwrt) \
+            zstd clang llvm libelf-dev zlib1g-dev libzstd-dev pkg-config cmake make > /dev/null
+          sudo timedatectl set-timezone "$TZ"
+          sudo mkdir -p /workdir
+          sudo chown $USER:$GROUPS /workdir
+
+      - name: Download and extract SDK
+        working-directory: /workdir
+        run: |
+          wget -q "${{ steps.meta.outputs.sdk_url }}" -O "${{ steps.meta.outputs.sdk_file }}"
+          case "${{ steps.meta.outputs.sdk_file }}" in
+            *.tar.zst) tar --zstd -xf "${{ steps.meta.outputs.sdk_file }}" ;;
+            *) tar -xf "${{ steps.meta.outputs.sdk_file }}" ;;
+          esac
+          rm -f "${{ steps.meta.outputs.sdk_file }}"
+          for d in */; do
+            mv "$d" openwrt
+            break
+          done
+
+      - name: Clone tutuicmptunnel
+        working-directory: /workdir
+        run: |
+          SRC_REF="${{ github.event.inputs.src_ref }}"
+          if [ -n "$SRC_REF" ]; then
+            git clone --recursive --depth 1 -b "$SRC_REF" https://github.com/hrimfaxi/tutuicmptunnel.git tutuicmptunnel
+          else
+            git clone --recursive --depth 1 https://github.com/hrimfaxi/tutuicmptunnel.git tutuicmptunnel
+          fi
+
+      - name: Cross-compile user-space, libsodium & kernel module
+        working-directory: /workdir
+        run: |
+          TOOLCHAIN_DIR=$(find /workdir/openwrt/staging_dir -maxdepth 1 -type d -name "toolchain-*" | head -n 1)
+          TARGET_DIR=$(find /workdir/openwrt/staging_dir -maxdepth 1 -type d -name "target-*" | head -n 1)
+          LINUX_DIR=$(find /workdir/openwrt/build_dir -maxdepth 3 -type d -name "linux-[0-9]*" | head -n 1)
+
+          CROSS_GCC=$(find "${TOOLCHAIN_DIR}/bin" -name "*-openwrt-linux*-gcc" | head -n 1)
+          CROSS_PREFIX="${CROSS_GCC%gcc}"
+          TARGET_ARCH=$(basename "$CROSS_PREFIX" | cut -d'-' -f1)
+
+          case "$TARGET_ARCH" in
+            aarch64*) KARCH="arm64" ;;
+            arm*) KARCH="arm" ;;
+            x86_64*) KARCH="x86_64" ;;
+            mips*) KARCH="mips" ;;
+            riscv64*) KARCH="riscv" ;;
+            *) KARCH="$TARGET_ARCH" ;;
+          esac
+
+          export STAGING_DIR="$TARGET_DIR"
+          export PATH="${TOOLCHAIN_DIR}/bin:${PATH}"
+
+          # 1. 编译目标架构所需的 zlib、libelf 及 libsodium 动态库
+          cd /workdir/openwrt
+          ./scripts/feeds update base packages
+          ./scripts/feeds install libelf zlib libsodium
+          make defconfig
+          make package/zlib/compile -j$(nproc) || make package/libs/zlib/compile -j$(nproc)
+          make package/elfutils/compile -j$(nproc) || make package/libs/elfutils/compile -j$(nproc)
+          make package/libsodium/compile -j$(nproc) || make package/libs/libsodium/compile -j$(nproc)
+
+          SYSROOT_FLAGS="--sysroot=${TOOLCHAIN_DIR} -I${TARGET_DIR}/usr/include -I${TOOLCHAIN_DIR}/include -fPIC"
+          LDFLAGS_FLAGS="--sysroot=${TOOLCHAIN_DIR} -L${TARGET_DIR}/usr/lib -L${TOOLCHAIN_DIR}/lib -no-pie"
+
+          XDP_FLAG="0"
+          [ "${{ github.event.inputs.enable_xdp }}" = "true" ] && XDP_FLAG="1"
+
+          mkdir -p /workdir/tutuicmptunnel/build /workdir/release_files /workdir/install_stage
+          cd /workdir/tutuicmptunnel/build
+
+          # 2. 原生 CMake 配置（未修改任何源码，保留完整 BTF 与 bpf_timer）
+          cmake .. \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR="$TARGET_ARCH" \
+            -DCMAKE_C_COMPILER="${CROSS_PREFIX}gcc" \
+            -DCMAKE_CXX_COMPILER="${CROSS_PREFIX}g++" \
+            -DCMAKE_SYSROOT="${TOOLCHAIN_DIR}" \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DCMAKE_C_FLAGS="${SYSROOT_FLAGS}" \
+            -DCMAKE_CXX_FLAGS="${SYSROOT_FLAGS}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS_FLAGS}" \
+            -DCMAKE_FIND_ROOT_PATH="${TARGET_DIR};${TOOLCHAIN_DIR}" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_HARDEN_MODE=1 \
+            -DUSE_SYSTEM_LIBBPF_BPFTOOL=0 \
+            -DDISABLE_BPF_TIMER=0 \
+            -DENABLE_XDP_INGRESS="$XDP_FLAG"
+
+          # 3. 阶段一：纯宿主机环境单独编译 bpftool
+          make -j$(nproc) build_bpftool
+
+          # 4. 阶段二：交叉编译目标架构 libbpf 与用户态程序
+          make -j$(nproc) EXTRA_CFLAGS="${SYSROOT_FLAGS}" EXTRA_LDFLAGS="${LDFLAGS_FLAGS}"
+
+          # 5. 提取全部 tuctl* / tuserver* 可执行文件
+          DESTDIR=/workdir/install_stage cmake --install . || true
+          find /workdir/install_stage /workdir/tutuicmptunnel/build \
+            -not -path "*/CMakeFiles/*" \
+            -type f -executable \( -name "tuctl*" -o -name "tuserver*" \) | while read -r bin; do
+            "${CROSS_PREFIX}strip" "$bin" 2>/dev/null || true
+            cp -vf "$bin" /workdir/release_files/
+          done
+
+          # 6. 提取目标架构 libsodium.so 与 libsodium.so.26
+          find "${TARGET_DIR}/usr/lib" /workdir/openwrt/build_dir -name "libsodium.so*" -type f | head -n 1 | while read -r sofile; do
+            "${CROSS_PREFIX}strip" --strip-unneeded "$sofile" 2>/dev/null || true
+            cp -vf "$sofile" /workdir/release_files/libsodium.so
+            cp -vf "$sofile" /workdir/release_files/libsodium.so.26
+          done
+
+          # 7. 独立编译目标内核模块 tutu_csum_fixup.ko
+          if [ -d "/workdir/tutuicmptunnel/tutu_csum_fixup" ] && [ -n "$LINUX_DIR" ]; then
+            make -C "$LINUX_DIR" \
+              ARCH="$KARCH" \
+              CROSS_COMPILE="$CROSS_PREFIX" \
+              M="/workdir/tutuicmptunnel/tutu_csum_fixup" \
+              modules
+            cp -vf /workdir/tutuicmptunnel/tutu_csum_fixup/*.ko /workdir/release_files/
+          fi
+
+          # 8. 打包完整离线归档
+          tar -czf "/workdir/${{ steps.meta.outputs.release_tag }}.tar.gz" -C /workdir/release_files .
+          mv "/workdir/${{ steps.meta.outputs.release_tag }}.tar.gz" /workdir/release_files/
+
+          echo "=== 最终输出产物及架构校验 ==="
+          ls -lh /workdir/release_files/
+          file /workdir/release_files/* || true
+
+      - name: Check output files
+        id: tag
+        run: |
+          if [ -n "$(ls -A /workdir/release_files 2>/dev/null)" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ 未找到任何编译产物!"
+            exit 1
+          fi
+
+      - name: Upload Package to release
+        uses: softprops/action-gh-release@v2
+        if: steps.tag.outputs.status == 'success' && github.event.inputs.upload_release != false && !cancelled()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: ${{ steps.meta.outputs.release_tag }}
+          body: |
+            - **Mode**: `eBPF (Clean Upstream Build with BTF)` (XDP Ingress: `${{ github.event.inputs.enable_xdp || false }}`)
+            - **Distro**: `${{ github.event.inputs.distro || 'immortalwrt' }}`
+            - **Version**: `${{ github.event.inputs.version || '25.12.0' }}`
+            - **Target**: `${{ github.event.inputs.target == 'custom' && github.event.inputs.custom_target || (github.event.inputs.target || 'qualcommax/ipq807x') }}`
+            - **SDK**: `${{ steps.meta.outputs.sdk_file }}`
+          files: /workdir/release_files/*
