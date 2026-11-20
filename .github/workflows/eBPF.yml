@@ -92,7 +92,7 @@ jobs:
             BASE_HOST="https://downloads.openwrt.org"
           fi
 
-          if [ "$VERSION" = "SNAPSHOT" ] \vert{}\vert{} [ "$VERSION" = "snapshot" ]; then
+          if [ "$VERSION" = "SNAPSHOT" ] || [ "$VERSION" = "snapshot" ]; then
             SDK_BASE_URL="${BASE_HOST}/snapshots/targets/${TARGET}/"
             VER_TAG="snapshot"
           else
@@ -179,4 +179,138 @@ jobs:
           PKG_RELEASE:=1
 
           PKG_SOURCE:=tutuicmptunnel-bpf-src.tar.gz
-          PKG
+          PKG_BUILD_DIR:=$(BUILD_DIR)/tutu-src
+          PKG_LICENSE:=GPL-2.0-or-later
+
+          CMAKE_GENERATOR:=Unix Makefiles
+
+          include $(INCLUDE_DIR)/package.mk
+          include $(INCLUDE_DIR)/cmake.mk
+
+          CMAKE_OPTIONS += \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_HARDEN_MODE=1 \
+            -DUSE_SYSTEM_LIBBPF_BPFTOOL=0 \
+            -DENABLE_XDP_INGRESS=__XDP_FLAG__
+
+          define Build/Configure
+          	(cd $(PKG_BUILD_DIR); \
+          		$(CMAKE_VARS) \
+          		cmake \
+          			-G "Unix Makefiles" \
+          			-DCMAKE_TOOLCHAIN_FILE=$(TOOLCHAIN_DIR)/toolchain.cmake \
+          			-DCMAKE_INSTALL_PREFIX=/usr \
+          			$(CMAKE_OPTIONS) \
+          			. \
+          	)
+          endef
+
+          define Package/tutuicmptunnel-bpf
+            SECTION:=net
+            CATEGORY:=Network
+            TITLE:=eBPF-based UDP-to-ICMP protocol morpher
+            DEPENDS:=+libelf +zlib +kmod-tutu-csum-fixup
+          endef
+
+          define KernelPackage/tutu-csum-fixup
+            SUBMENU:=Network Support
+            TITLE:=Checksum fixup kernel module for tutuicmptunnel eBPF
+            FILES:=$(PKG_BUILD_DIR)/tutu_csum_fixup/tutu_csum_fixup.ko
+            AUTOLOAD:=$(call AutoProbe,tutu_csum_fixup)
+          endef
+
+          define Build/Compile
+          	$(MAKE) -C $(PKG_BUILD_DIR)
+          	if [ -d "$(PKG_BUILD_DIR)/tutu_csum_fixup" ]; then \
+          		$(KERNEL_MAKE) M="$(PKG_BUILD_DIR)/tutu_csum_fixup" modules; \
+          	fi
+          endef
+
+          define Package/tutuicmptunnel-bpf/install
+          	$(INSTALL_DIR) $(1)/usr/bin
+          	find $(PKG_BUILD_DIR) -maxdepth 2 -type f -executable \( -name "tuctl*" -o -name "tuserver*" \) -exec $(INSTALL_BIN) {} $(1)/usr/bin/ \;
+          endef
+
+          $(eval $(call BuildPackage,tutuicmptunnel-bpf))
+          $(eval $(call KernelPackage,tutu-csum-fixup))
+          EOF
+
+          sed -i 's/^          //' package/tutuicmptunnel-bpf/Makefile
+          sed -i "s/__XDP_FLAG__/${XDP_FLAG}/g" package/tutuicmptunnel-bpf/Makefile
+
+          ./scripts/feeds update base packages
+          ./scripts/feeds install libelf zlib
+
+          make defconfig
+          sed -i 's/^CONFIG_ALL_KMODS=y/# CONFIG_ALL_KMODS is not set/' .config
+          sed -i 's/^# \(CONFIG_PACKAGE_.*tutu.*\) is not set/\1=m/' .config
+          make defconfig
+
+          echo "=== 已选中的 tutuicmptunnel-bpf 配置项 ==="
+          grep -i "tutu" .config || true
+
+      - name: Compile tutuicmptunnel-bpf
+        run: |
+          cd /workdir/openwrt
+
+          make package/tutuicmptunnel-bpf/clean V=s
+          if ! KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" \
+            make package/tutuicmptunnel-bpf/compile -j1 V=s > /workdir/build.log 2>&1; then
+            echo "❌ 编译失败，以下为最后 80 行真实错误日志："
+            tail -n 80 /workdir/build.log
+            exit 1
+          fi
+
+          mkdir -p /workdir/release_files /workdir/pkg_extract
+          find bin/ -type f \( -name "*tutu*.ipk" -o -name "*tutu*.apk" \) -exec cp -v {} /workdir/release_files/ \;
+
+          APK_BIN=$(find /workdir/openwrt/staging_dir/host/ -name "apk" -type f -executable 2>/dev/null | head -n 1)
+          if [ -n "$APK_BIN" ] && ls /workdir/release_files/*.apk >/dev/null 2>&1; then
+            cd /workdir/pkg_extract
+            for f in /workdir/release_files/*.apk; do
+              "$APK_BIN" extract --allow-untrusted "$f"
+            done
+          fi
+
+          if ls /workdir/release_files/*.ipk >/dev/null 2>&1; then
+            cd /workdir/pkg_extract
+            for f in /workdir/release_files/*.ipk; do
+              mkdir -p tmp_ipk
+              tar -xzf "$f" -C tmp_ipk
+              tar -xzf tmp_ipk/data.tar.gz -C /workdir/pkg_extract
+              rm -rf tmp_ipk
+            done
+          fi
+
+          find /workdir/pkg_extract -name "*.ko" -exec cp -v {} /workdir/release_files/ \;
+          find /workdir/pkg_extract -path "*/usr/bin/*" -type f -exec cp -v {} /workdir/release_files/ \;
+          find /workdir/pkg_extract -path "*/usr/sbin/*" -type f -exec cp -v {} /workdir/release_files/ \;
+
+          echo "=== 最终输出文件列表 ==="
+          ls -lh /workdir/release_files/
+
+      - name: Check output files
+        id: tag
+        run: |
+          if [ -n "$(ls -A /workdir/release_files 2>/dev/null)" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ 未找到编译产物 (.ipk / .apk)!"
+            exit 1
+          fi
+
+      - name: Upload Package to release
+        uses: softprops/action-gh-release@v2
+        if: steps.tag.outputs.status == 'success' && github.event.inputs.upload_release != false && !cancelled()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: ${{ steps.meta.outputs.release_tag }}
+          body: |
+            - **Mode**: `eBPF` (XDP Ingress: `${{ github.event.inputs.enable_xdp || false }}`)
+            - **Distro**: `${{ github.event.inputs.distro || 'immortalwrt' }}`
+            - **Version**: `${{ github.event.inputs.version || '25.12.0' }}`
+            - **Target**: `${{ github.event.inputs.target == 'custom' && github.event.inputs.custom_target || (github.event.inputs.target || 'qualcommax/ipq807x') }}`
+            - **SDK**: `${{ steps.meta.outputs.sdk_file }}`
+          files: /workdir/release_files/*
