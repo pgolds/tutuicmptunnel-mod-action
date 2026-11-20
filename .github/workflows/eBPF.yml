@@ -1,4 +1,4 @@
-name: Build tutuicmptunnel (eBPF Multi-Version)
+name: Build tutuicmptunnel (Official OpenWrt Guide)
 
 on:
   repository_dispatch:
@@ -42,7 +42,7 @@ on:
         type: string
         default: ''
       enable_xdp:
-        description: '开启 XDP Ingress 极致性能模式 (tcpdump 将只能看到还原后的 UDP)'
+        description: '开启 XDP Ingress 模式 (tcpdump 仅可见还原后的 UDP)'
         required: false
         type: boolean
         default: false
@@ -100,11 +100,10 @@ jobs:
             VER_TAG="${VERSION}"
           fi
 
-          echo "正在查询 SDK 目录: ${SDK_BASE_URL}"
           SDK_FILE=$(curl -fsSLg "$SDK_BASE_URL" | sed -n "s/.*href=\"\(${DISTRO}-sdk-[^\"]*Linux-x86_64\.tar\.[xzst]*\)\".*/\1/p" | head -n 1)
 
           if [ -z "$SDK_FILE" ]; then
-            echo "❌ 未能在 ${SDK_BASE_URL} 找到匹配的 SDK 文件，请核对版本号与架构拼写！"
+            echo "❌ 未能在 ${SDK_BASE_URL} 找到匹配的 SDK 文件！"
             exit 1
           fi
 
@@ -115,9 +114,6 @@ jobs:
           echo "sdk_file=${SDK_FILE}" >> $GITHUB_OUTPUT
           echo "release_tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
 
-          echo "✅ 匹配到 SDK: ${SDK_FILE}"
-          echo "✅ Release Tag: ${RELEASE_TAG}"
-
       - name: Initialization environment
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -125,7 +121,7 @@ jobs:
           sudo -E apt-get -qq update
           sudo -E apt-get -qq install -y \
             $(curl -fsSL https://raw.githubusercontent.com/nantayo/My-Pkg/master/openwrt) \
-            zstd clang llvm libelf-dev pkg-config > /dev/null
+            zstd clang llvm libelf-dev zlib1g-dev pkg-config cmake make > /dev/null
           sudo timedatectl set-timezone "$TZ"
           sudo mkdir -p /workdir
           sudo chown $USER:$GROUPS /workdir
@@ -133,160 +129,107 @@ jobs:
       - name: Download and extract SDK
         working-directory: /workdir
         run: |
-          df -hT $PWD
           wget -q "${{ steps.meta.outputs.sdk_url }}" -O "${{ steps.meta.outputs.sdk_file }}"
-
           case "${{ steps.meta.outputs.sdk_file }}" in
-            *.tar.zst)
-              tar --zstd -xf "${{ steps.meta.outputs.sdk_file }}"
-              ;;
-            *)
-              tar -xf "${{ steps.meta.outputs.sdk_file }}"
-              ;;
+            *.tar.zst) tar --zstd -xf "${{ steps.meta.outputs.sdk_file }}" ;;
+            *) tar -xf "${{ steps.meta.outputs.sdk_file }}" ;;
           esac
-
           rm -f "${{ steps.meta.outputs.sdk_file }}"
           for d in */; do
             mv "$d" openwrt
             break
           done
 
-      - name: Prepare tutuicmptunnel (BPF) OpenWrt Package
+      - name: Clone tutuicmptunnel & read official docs/openwrt.md
+        working-directory: /workdir
         run: |
-          cd /workdir/openwrt
-
           SRC_REF="${{ github.event.inputs.src_ref }}"
           if [ -n "$SRC_REF" ]; then
-            git clone --recursive --depth 1 -b "$SRC_REF" https://github.com/hrimfaxi/tutuicmptunnel.git /workdir/tutu-src
+            git clone --recursive --depth 1 -b "$SRC_REF" https://github.com/hrimfaxi/tutuicmptunnel.git tutuicmptunnel
           else
-            git clone --recursive --depth 1 https://github.com/hrimfaxi/tutuicmptunnel.git /workdir/tutu-src
+            git clone --recursive --depth 1 https://github.com/hrimfaxi/tutuicmptunnel.git tutuicmptunnel
           fi
 
-          mkdir -p dl package/tutuicmptunnel-bpf
-          tar -czf dl/tutuicmptunnel-bpf-src.tar.gz -C /workdir tutu-src
+          echo "=== 官方 docs/openwrt.md 内容 ==="
+          cat tutuicmptunnel/docs/openwrt.md || true
 
+      - name: Cross-compile user-space & kernel module (Official Guide Way)
+        working-directory: /workdir
+        run: |
+          # 1. 定位 OpenWrt SDK 交叉编译工具链与内核源码目录
+          TOOLCHAIN_DIR=$(find /workdir/openwrt/staging_dir -maxdepth 1 -type d -name "toolchain-*" | head -n 1)
+          TARGET_DIR=$(find /workdir/openwrt/staging_dir -maxdepth 1 -type d -name "target-*" | head -n 1)
+          LINUX_DIR=$(find /workdir/openwrt/build_dir -maxdepth 3 -type d -name "linux-[0-9]*" | head -n 1)
+
+          # 自动识别交叉编译器前缀 (如 aarch64-openwrt-linux-musl-)
+          CROSS_GCC=$(find "${TOOLCHAIN_DIR}/bin" -name "*-openwrt-linux*-gcc" | head -n 1)
+          CROSS_PREFIX="${CROSS_GCC%gcc}"
+          TARGET_ARCH=$(basename "$CROSS_PREFIX" | cut -d'-' -f1)
+
+          # 映射 Linux ARCH 变量
+          case "$TARGET_ARCH" in
+            aarch64*) KARCH="arm64" ;;
+            arm*) KARCH="arm" ;;
+            x86_64*) KARCH="x86_64" ;;
+            mips*) KARCH="mips" ;;
+            riscv64*) KARCH="riscv" ;;
+            *) KARCH="$TARGET_ARCH" ;;
+          esac
+
+          export STAGING_DIR="$TARGET_DIR"
+          export PATH="${TOOLCHAIN_DIR}/bin:${PATH}"
+
+          echo "TOOLCHAIN_DIR: $TOOLCHAIN_DIR"
+          echo "CROSS_PREFIX:  $CROSS_PREFIX"
+          echo "LINUX_DIR:     $LINUX_DIR"
+          echo "KARCH:         $KARCH"
+
+          # 2. 按官方方式：原生 CMake 独立交叉编译用户态程序（宿主机自动编译 host bpftool，目标机交叉编译 tuctl/tuserver）
           XDP_FLAG="0"
-          if [ "${{ github.event.inputs.enable_xdp }}" = "true" ]; then
-            XDP_FLAG="1"
-          fi
+          [ "${{ github.event.inputs.enable_xdp }}" = "true" ] && XDP_FLAG="1"
 
-          cat << 'EOF' > package/tutuicmptunnel-bpf/Makefile
-          include $(TOPDIR)/rules.mk
-          include $(INCLUDE_DIR)/kernel.mk
+          mkdir -p /workdir/tutuicmptunnel/build /workdir/release_files
+          cd /workdir/tutuicmptunnel/build
 
-          PKG_NAME:=tutuicmptunnel-bpf
-          PKG_VERSION:=1.7
-          PKG_RELEASE:=1
-
-          PKG_SOURCE:=tutuicmptunnel-bpf-src.tar.gz
-          PKG_BUILD_DIR:=$(BUILD_DIR)/tutu-src
-          PKG_LICENSE:=GPL-2.0-or-later
-
-          CMAKE_GENERATOR:=Unix Makefiles
-
-          include $(INCLUDE_DIR)/package.mk
-          include $(INCLUDE_DIR)/cmake.mk
-
-          CMAKE_OPTIONS += \
+          cmake .. \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR="$TARGET_ARCH" \
+            -DCMAKE_C_COMPILER="${CROSS_PREFIX}gcc" \
+            -DCMAKE_CXX_COMPILER="${CROSS_PREFIX}g++" \
+            -DCMAKE_FIND_ROOT_PATH="${TARGET_DIR};${TOOLCHAIN_DIR}" \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_HARDEN_MODE=1 \
             -DUSE_SYSTEM_LIBBPF_BPFTOOL=0 \
-            -DENABLE_XDP_INGRESS=__XDP_FLAG__
+            -DDISABLE_BPF_TIMER=0 \
+            -DENABLE_XDP_INGRESS="$XDP_FLAG"
 
-          define Build/Configure
-          	(cd $(PKG_BUILD_DIR); \
-          		$(CMAKE_VARS) \
-          		cmake \
-          			-G "Unix Makefiles" \
-          			-DCMAKE_TOOLCHAIN_FILE=$(TOOLCHAIN_DIR)/toolchain.cmake \
-          			-DCMAKE_INSTALL_PREFIX=/usr \
-          			$(CMAKE_OPTIONS) \
-          			. \
-          	)
-          endef
+          make -j$(nproc)
 
-          define Package/tutuicmptunnel-bpf
-            SECTION:=net
-            CATEGORY:=Network
-            TITLE:=eBPF-based UDP-to-ICMP protocol morpher
-            DEPENDS:=+libelf +zlib +kmod-tutu-csum-fixup
-          endef
+          # 复制编译好的用户态二进制文件（剥离调试符号减小体积）
+          for bin in tuctl tuctl_client tuctl_server tuserver; do
+            if [ -f "$bin" ]; then
+              "${CROSS_PREFIX}strip" "$bin" || true
+              cp -v "$bin" /workdir/release_files/
+            fi
+          done
 
-          define KernelPackage/tutu-csum-fixup
-            SUBMENU:=Network Support
-            TITLE:=Checksum fixup kernel module for tutuicmptunnel eBPF
-            FILES:=$(PKG_BUILD_DIR)/tutu_csum_fixup/tutu_csum_fixup.ko
-            AUTOLOAD:=$(call AutoProbe,tutu_csum_fixup)
-          endef
-
-          define Build/Compile
-          	$(MAKE) -C $(PKG_BUILD_DIR)
-          	if [ -d "$(PKG_BUILD_DIR)/tutu_csum_fixup" ]; then \
-          		$(KERNEL_MAKE) M="$(PKG_BUILD_DIR)/tutu_csum_fixup" modules; \
-          	fi
-          endef
-
-          define Package/tutuicmptunnel-bpf/install
-          	$(INSTALL_DIR) $(1)/usr/bin
-          	find $(PKG_BUILD_DIR) -maxdepth 2 -type f -executable \( -name "tuctl*" -o -name "tuserver*" \) -exec $(INSTALL_BIN) {} $(1)/usr/bin/ \;
-          endef
-
-          $(eval $(call BuildPackage,tutuicmptunnel-bpf))
-          $(eval $(call KernelPackage,tutu-csum-fixup))
-          EOF
-
-          sed -i 's/^          //' package/tutuicmptunnel-bpf/Makefile
-          sed -i "s/__XDP_FLAG__/${XDP_FLAG}/g" package/tutuicmptunnel-bpf/Makefile
-
-          ./scripts/feeds update base packages
-          ./scripts/feeds install libelf zlib
-
-          make defconfig
-          sed -i 's/^CONFIG_ALL_KMODS=y/# CONFIG_ALL_KMODS is not set/' .config
-          sed -i 's/^# \(CONFIG_PACKAGE_.*tutu.*\) is not set/\1=m/' .config
-          make defconfig
-
-          echo "=== 已选中的 tutuicmptunnel-bpf 配置项 ==="
-          grep -i "tutu" .config || true
-
-      - name: Compile tutuicmptunnel-bpf
-        run: |
-          cd /workdir/openwrt
-
-          make package/tutuicmptunnel-bpf/clean V=s
-          if ! KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" \
-            make package/tutuicmptunnel-bpf/compile -j1 V=s > /workdir/build.log 2>&1; then
-            echo "❌ 编译失败，以下为最后 80 行真实错误日志："
-            tail -n 80 /workdir/build.log
-            exit 1
+          # 3. 按官方方式：针对目标 SDK 内核树独立编译 tutu_csum_fixup.ko
+          if [ -d "/workdir/tutuicmptunnel/tutu_csum_fixup" ] && [ -n "$LINUX_DIR" ]; then
+            make -C "$LINUX_DIR" \
+              ARCH="$KARCH" \
+              CROSS_COMPILE="$CROSS_PREFIX" \
+              M="/workdir/tutuicmptunnel/tutu_csum_fixup" \
+              modules
+            cp -v /workdir/tutuicmptunnel/tutu_csum_fixup/*.ko /workdir/release_files/
           fi
 
-          mkdir -p /workdir/release_files /workdir/pkg_extract
-          find bin/ -type f \( -name "*tutu*.ipk" -o -name "*tutu*.apk" \) -exec cp -v {} /workdir/release_files/ \;
+          # 打包一个方便解压即用的 tar.gz 归档
+          tar -czf "/workdir/release_files/${{ steps.meta.outputs.release_tag }}.tar.gz" -C /workdir/release_files .
 
-          APK_BIN=$(find /workdir/openwrt/staging_dir/host/ -name "apk" -type f -executable 2>/dev/null | head -n 1)
-          if [ -n "$APK_BIN" ] && ls /workdir/release_files/*.apk >/dev/null 2>&1; then
-            cd /workdir/pkg_extract
-            for f in /workdir/release_files/*.apk; do
-              "$APK_BIN" extract --allow-untrusted "$f"
-            done
-          fi
-
-          if ls /workdir/release_files/*.ipk >/dev/null 2>&1; then
-            cd /workdir/pkg_extract
-            for f in /workdir/release_files/*.ipk; do
-              mkdir -p tmp_ipk
-              tar -xzf "$f" -C tmp_ipk
-              tar -xzf tmp_ipk/data.tar.gz -C /workdir/pkg_extract
-              rm -rf tmp_ipk
-            done
-          fi
-
-          find /workdir/pkg_extract -name "*.ko" -exec cp -v {} /workdir/release_files/ \;
-          find /workdir/pkg_extract -path "*/usr/bin/*" -type f -exec cp -v {} /workdir/release_files/ \;
-          find /workdir/pkg_extract -path "*/usr/sbin/*" -type f -exec cp -v {} /workdir/release_files/ \;
-
-          echo "=== 最终输出文件列表 ==="
+          echo "=== 最终输出产物 ==="
           ls -lh /workdir/release_files/
 
       - name: Check output files
@@ -295,7 +238,7 @@ jobs:
           if [ -n "$(ls -A /workdir/release_files 2>/dev/null)" ]; then
             echo "status=success" >> $GITHUB_OUTPUT
           else
-            echo "❌ 未找到编译产物 (.ipk / .apk)!"
+            echo "❌ 未找到任何编译产物!"
             exit 1
           fi
 
@@ -308,7 +251,7 @@ jobs:
           tag_name: ${{ steps.meta.outputs.release_tag }}
           name: ${{ steps.meta.outputs.release_tag }}
           body: |
-            - **Mode**: `eBPF` (XDP Ingress: `${{ github.event.inputs.enable_xdp || false }}`)
+            - **Mode**: `eBPF (Official Direct Cross-Compile)` (XDP Ingress: `${{ github.event.inputs.enable_xdp || false }}`)
             - **Distro**: `${{ github.event.inputs.distro || 'immortalwrt' }}`
             - **Version**: `${{ github.event.inputs.version || '25.12.0' }}`
             - **Target**: `${{ github.event.inputs.target == 'custom' && github.event.inputs.custom_target || (github.event.inputs.target || 'qualcommax/ipq807x') }}`
