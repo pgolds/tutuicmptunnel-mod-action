@@ -32,15 +32,10 @@ on:
           - ramips/mt7621
           - custom
       custom_target:
-        description: '自定义 Target/Subtarget (仅当上方选 custom 时生效，如 armsr/armv8)'
+        description: '自定义 Target/Subtarget (仅当上方选 custom 时生效，如 bcm27xx/bcm2711)'
         required: false
         type: string
         default: ''
-      ssh:
-        description: '开启 SSH 远程调试 (tmate)'
-        required: false
-        type: boolean
-        default: false
       upload_release:
         description: '自动上传到 GitHub Release'
         required: false
@@ -72,7 +67,7 @@ jobs:
           fi
 
           if [ -z "$TARGET" ] || [[ "$TARGET" != */* ]]; then
-            echo "❌ 错误: Target 格式必须为 <target>/<subtarget>，例如 x86/64 或 mediatek/filogic"
+            echo "❌ 错误: Target 格式必须为 <target>/<subtarget>，例如 x86/64 或 bcm27xx/bcm2711"
             exit 1
           fi
 
@@ -141,32 +136,41 @@ jobs:
           cp -r $GITHUB_WORKSPACE/pkg_repo /workdir/openwrt/package/tutuicmptunnel
 
           cd /workdir/openwrt
+          # 更新 feeds 并安装完整包索引，避免依赖缺失导致包被 defconfig 隐藏
           ./scripts/feeds update -a
-          ./scripts/feeds install libmnl
+          ./scripts/feeds install -a
 
-          # 1. 生成默认 .config 以扫描出所有包配置项
+          # 1. 生成默认 .config 并刷新包索引
           make defconfig
 
-          # 2. 动态匹配 tutuicmptunnel 相关的所有 CONFIG_PACKAGE_ 项并设为 =y
-          grep -E "^# CONFIG_PACKAGE_.*tutuicmptunnel is not set" .config | sed 's/# \(CONFIG_PACKAGE_[^ ]*\) is not set/\1=y/' >> .config
+          # 2. 打印包索引中的真实包名用于核对
+          echo "=== 包索引中的定义 ==="
+          grep -i -C 3 "tutu" tmp/.config-package.in || true
 
-          # 3. 再次运行 defconfig 自动解析并选中依赖
+          # 3. 兼容未选中状态 (# CONFIG_... is not set) 设为 =m
+          sed -i 's/^# \(CONFIG_PACKAGE_.*tutu.*\) is not set/\1=m/' .config
+          if ! grep -q "CONFIG_PACKAGE_.*tutu" .config; then
+            echo "CONFIG_PACKAGE_kmod-tutuicmptunnel=m" >> .config
+            echo "CONFIG_PACKAGE_tutuicmptunnel=m" >> .config
+          fi
+
+          # 4. 再次运行 defconfig 自动解析并选中依赖
           make defconfig
 
           echo "=== 已选中的 tutuicmptunnel 配置项 ==="
-          grep -i "tutuicmptunnel" .config
-
-      - name: SSH connection to Actions
-        uses: mxschmitt/action-tmate@v3
-        if: github.event.inputs.ssh == true
+          grep -i "tutu" .config || true
 
       - name: Compile tutuicmptunnel
         run: |
           cd /workdir/openwrt
 
-          # 清理旧缓存并编译内核模块与用户态工具
+          # 清理旧缓存并强制以模块形式编译
           make package/tutuicmptunnel/clean V=s
-          KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" make package/tutuicmptunnel/compile V=s
+          KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" \
+            make package/tutuicmptunnel/compile \
+            CONFIG_PACKAGE_kmod-tutuicmptunnel=m \
+            CONFIG_PACKAGE_tutuicmptunnel=m \
+            V=s
 
           mkdir -p /workdir/release_files /workdir/pkg_extract
           find bin/ -type f \( -name "*tutu*.ipk" -o -name "*tutu*.apk" \) -exec cp -v {} /workdir/release_files/ \;
