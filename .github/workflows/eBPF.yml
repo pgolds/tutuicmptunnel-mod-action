@@ -173,7 +173,6 @@ jobs:
           export STAGING_DIR="$TARGET_DIR"
           export PATH="${TOOLCHAIN_DIR}/bin:${PATH}"
 
-          # 1. 使用 OpenWrt SDK 编译目标架构的 zlib、libelf 以及文档所需的 libsodium.so
           cd /workdir/openwrt
           ./scripts/feeds update base packages
           ./scripts/feeds install libelf zlib libsodium
@@ -181,6 +180,24 @@ jobs:
           make package/zlib/compile -j$(nproc) || make package/libs/zlib/compile -j$(nproc)
           make package/elfutils/compile -j$(nproc) || make package/libs/elfutils/compile -j$(nproc)
           make package/libsodium/compile -j$(nproc) || make package/libs/libsodium/compile -j$(nproc)
+
+          # 关键补丁：修改内置 libbpf 源码，在缺少 /sys/kernel/btf/vmlinux 的无 BTF 内核上跳过 vmlinux BTF 加载而非报 -ESRCH
+          python3 -c '
+          path = "/workdir/tutuicmptunnel/libbpf/src/libbpf.c"
+          with open(path, "r") as f:
+              code = f.read()
+          target = "int bpf_object__load_vmlinux_btf(struct bpf_object *obj, bool force)"
+          idx = code.find(target)
+          if idx != -1:
+              brace = code.find("{", idx)
+              patch = "\n\tif (!force && access(\"/sys/kernel/btf/vmlinux\", F_OK) != 0) { obj->btf_vmlinux = NULL; return 0; }\n"
+              code = code[:brace+1] + patch + code[brace+1:]
+              with open(path, "w") as f:
+                  f.write(code)
+              print("✅ 已成功为内置 libbpf 打上无 BTF 内核兼容补丁")
+          else:
+              print("⚠️ 未找到目标函数，请检查 libbpf 版本")
+          '
 
           SYSROOT_FLAGS="--sysroot=${TOOLCHAIN_DIR} -I${TARGET_DIR}/usr/include -I${TOOLCHAIN_DIR}/include -fPIC"
           LDFLAGS_FLAGS="--sysroot=${TOOLCHAIN_DIR} -L${TARGET_DIR}/usr/lib -L${TOOLCHAIN_DIR}/lib -no-pie"
@@ -191,7 +208,6 @@ jobs:
           mkdir -p /workdir/tutuicmptunnel/build /workdir/release_files /workdir/install_stage
           cd /workdir/tutuicmptunnel/build
 
-          # 1. CMake 配置阶段：关闭依赖 BTF 的 bpf_timer
           cmake .. \
             -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_SYSTEM_PROCESSOR="$TARGET_ARCH" \
@@ -215,17 +231,6 @@ jobs:
           make -j$(nproc) build_bpftool
           make -j$(nproc) EXTRA_CFLAGS="${SYSROOT_FLAGS}" EXTRA_LDFLAGS="${LDFLAGS_FLAGS}"
 
-          # 1. 找到所有编出来的 .bpf.o，彻底剥离 .BTF 和 .BTF.ext 段
-          find /workdir/tutuicmptunnel -name "*.bpf.o" | while read -r bpfobj; do
-            echo "Stripping BTF from $bpfobj"
-            llvm-objcopy --remove-section .BTF --remove-section .BTF.ext "$bpfobj"
-          done
-
-          # 2. 删除已生成的 .skel.h，强制 CMake/Make 基于无 BTF 的 .bpf.o 重新生成骨架头文件并链接 tuctl
-          find /workdir/tutuicmptunnel -name "*.skel.h" -delete
-          make -j$(nproc) EXTRA_CFLAGS="${SYSROOT_FLAGS}" EXTRA_LDFLAGS="${LDFLAGS_FLAGS}"
-
-          # 2. 提取全部 tuctl* / tuserver* 用户态二进制文件（同时覆盖 CMake 安装目录与子构建目录）
           DESTDIR=/workdir/install_stage cmake --install . || true
           find /workdir/install_stage /workdir/tutuicmptunnel/build \
             -not -path "*/CMakeFiles/*" \
@@ -234,15 +239,12 @@ jobs:
             cp -vf "$bin" /workdir/release_files/
           done
 
-          # 3. 提取目标架构的 libsodium.so 动态库（同时拷贝真实 .so 文件与 libsodium.so 软链接/副本）
-          find "${TARGET_DIR}/usr/lib" /workdir/openwrt/build_dir -name "libsodium.so*" -type f | while read -r sofile; do
+          find "${TARGET_DIR}/usr/lib" /workdir/openwrt/build_dir -name "libsodium.so*" -type f | head -n 1 | while read -r sofile; do
             "${CROSS_PREFIX}strip" --strip-unneeded "$sofile" 2>/dev/null || true
-            cp -vf "$sofile" /workdir/release_files/
-            # 确保同时存在名为 libsodium.so 的直接可用文件
             cp -vf "$sofile" /workdir/release_files/libsodium.so
+            cp -vf "$sofile" /workdir/release_files/libsodium.so.26
           done
 
-          # 4. 独立编译目标内核的 tutu_csum_fixup.ko
           if [ -d "/workdir/tutuicmptunnel/tutu_csum_fixup" ] && [ -n "$LINUX_DIR" ]; then
             make -C "$LINUX_DIR" \
               ARCH="$KARCH" \
@@ -252,13 +254,11 @@ jobs:
             cp -vf /workdir/tutuicmptunnel/tutu_csum_fixup/*.ko /workdir/release_files/
           fi
 
-          # 5. 生成完整离线部署包
           tar -czf "/workdir/${{ steps.meta.outputs.release_tag }}.tar.gz" -C /workdir/release_files .
           mv "/workdir/${{ steps.meta.outputs.release_tag }}.tar.gz" /workdir/release_files/
 
-          echo "=== 最终输出产物及架构校验 ==="
+          echo "=== 最终输出产物 ==="
           ls -lh /workdir/release_files/
-          file /workdir/release_files/* || true
 
       - name: Check output files
         id: tag
