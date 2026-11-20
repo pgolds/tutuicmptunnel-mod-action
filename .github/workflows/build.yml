@@ -1,0 +1,225 @@
+name: Build tutuicmptunnel-kmod (Multi-Version)
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      distro:
+        description: '固件发行版 (OpenWrt / ImmortalWrt)'
+        required: true
+        type: choice
+        default: 'immortalwrt'
+        options:
+          - immortalwrt
+          - openwrt
+      version:
+        description: '固件版本号 (如: 25.12.0, 24.10.1, 24.10.0 或 SNAPSHOT)'
+        required: true
+        type: string
+        default: '25.12.0'
+      target:
+        description: '目标架构 (选 custom 时读取下方自定义架构)'
+        required: true
+        type: choice
+        default: 'qualcommax/ipq807x'
+        options:
+          - qualcommax/ipq807x
+          - qualcommax/ipq60xx
+          - mediatek/filogic
+          - mediatek/mt7622
+          - rockchip/armv8
+          - x86/64
+          - ramips/mt7621
+          - custom
+      custom_target:
+        description: '自定义 Target/Subtarget (仅当上方选 custom 时生效，如 armsr/armv8)'
+        required: false
+        type: string
+        default: ''
+      ssh:
+        description: '开启 SSH 远程调试 (tmate)'
+        required: false
+        type: boolean
+        default: false
+      upload_release:
+        description: '自动上传到 GitHub Release'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout openwrt-tutuicmptunnel-kmod
+        uses: actions/checkout@v4
+        with:
+          path: pkg_repo
+
+      - name: Resolve build parameters & SDK URL
+        id: meta
+        run: |
+          DISTRO="${{ github.event.inputs.distro || 'immortalwrt' }}"
+          VERSION="${{ github.event.inputs.version || '25.12.0' }}"
+          TARGET="${{ github.event.inputs.target || 'qualcommax/ipq807x' }}"
+
+          if [ "$TARGET" = "custom" ]; then
+            TARGET="${{ github.event.inputs.custom_target }}"
+          fi
+
+          if [ -z "$TARGET" ] || [[ "$TARGET" != */* ]]; then
+            echo "❌ 错误: Target 格式必须为 <target>/<subtarget>，例如 x86/64 或 mediatek/filogic"
+            exit 1
+          fi
+
+          if [ "$DISTRO" = "immortalwrt" ]; then
+            BASE_HOST="https://downloads.immortalwrt.org"
+          else
+            BASE_HOST="https://downloads.openwrt.org"
+          fi
+
+          if [ "${VERSION^^}" = "SNAPSHOT" ]; then
+            SDK_BASE_URL="${BASE_HOST}/snapshots/targets/${TARGET}/"
+            VER_TAG="snapshot"
+          else
+            SDK_BASE_URL="${BASE_HOST}/releases/${VERSION}/targets/${TARGET}/"
+            VER_TAG="${VERSION}"
+          fi
+
+          echo "正在查询 SDK 目录: ${SDK_BASE_URL}"
+          SDK_FILE=$(curl -fsSL "$SDK_BASE_URL" | grep -oE "${DISTRO}-sdk-[^\"]*Linux-x86_64\.tar\.(zst|xz)" | head -n 1)
+
+          if [ -z "$SDK_FILE" ]; then
+            echo "❌ 未能在 ${SDK_BASE_URL} 找到匹配的 SDK 文件，请核对版本号与架构拼写！"
+            exit 1
+          fi
+
+          SAFE_TARGET="${TARGET//\//-}"
+          RELEASE_TAG="${DISTRO}-${VER_TAG}-${SAFE_TARGET}-tutuicmptunnel-kmod"
+
+          echo "sdk_url=${SDK_BASE_URL}${SDK_FILE}" >> $GITHUB_OUTPUT
+          echo "sdk_file=${SDK_FILE}" >> $GITHUB_OUTPUT
+          echo "release_tag=${RELEASE_TAG}" >> $GITHUB_OUTPUT
+
+          echo "✅ 匹配到 SDK: ${SDK_FILE}"
+          echo "✅ Release Tag: ${RELEASE_TAG}"
+
+      - name: Initialization environment
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install -y $(curl -fsSL https://raw.githubusercontent.com/nantayo/My-Pkg/master/openwrt) zstd > /dev/null
+          sudo timedatectl set-timezone "$TZ"
+          sudo mkdir -p /workdir
+          sudo chown $USER:$GROUPS /workdir
+
+      - name: Download and extract SDK
+        working-directory: /workdir
+        run: |
+          df -hT $PWD
+          wget -q "${{ steps.meta.outputs.sdk_url }}" -O "${{ steps.meta.outputs.sdk_file }}"
+
+          if [[ "${{ steps.meta.outputs.sdk_file }}" == *.tar.zst ]]; then
+            tar --zstd -xf "${{ steps.meta.outputs.sdk_file }}"
+          else
+            tar -xf "${{ steps.meta.outputs.sdk_file }}"
+          fi
+
+          rm -f "${{ steps.meta.outputs.sdk_file }}"
+          SDK_DIR=$(find . -maxdepth 1 -mindepth 1 -type d | head -n 1)
+          mv "$SDK_DIR" openwrt
+          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+      - name: Load and select tutuicmptunnel
+        run: |
+          # 直接复制当前仓库（openwrt-tutuicmptunnel-kmod）到 SDK 的 package 目录
+          cp -r $GITHUB_WORKSPACE/pkg_repo /workdir/openwrt/package/tutuicmptunnel
+
+          cd /workdir/openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install libmnl
+
+          # 1. 生成默认 .config 以扫描出所有包配置项
+          make defconfig
+
+          # 2. 动态匹配 tutuicmptunnel 相关的所有 CONFIG_PACKAGE_ 项并设为 =y
+          grep -E "^# CONFIG_PACKAGE_.*tutuicmptunnel is not set" .config | sed 's/# \(CONFIG_PACKAGE_[^ ]*\) is not set/\1=y/' >> .config
+
+          # 3. 再次运行 defconfig 自动解析并选中依赖
+          make defconfig
+
+          echo "=== 已选中的 tutuicmptunnel 配置项 ==="
+          grep -i "tutuicmptunnel" .config
+
+      - name: SSH connection to Actions
+        uses: mxschmitt/action-tmate@v3
+        if: github.event.inputs.ssh == true
+
+      - name: Compile tutuicmptunnel
+        run: |
+          cd /workdir/openwrt
+
+          # 清理旧缓存并编译内核模块与用户态工具
+          make package/tutuicmptunnel/clean V=s
+          KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" make package/tutuicmptunnel/compile V=s
+
+          mkdir -p /workdir/release_files /workdir/pkg_extract
+          find bin/ -type f \( -name "*tutu*.ipk" -o -name "*tutu*.apk" \) -exec cp -v {} /workdir/release_files/ \;
+
+          # 提取 .apk 中的 .ko 与二进制文件 (适用于 OpenWrt / ImmortalWrt 25.12+ / Snapshot)
+          APK_BIN=$(find /workdir/openwrt/staging_dir/host/ -name "apk" -type f -executable 2>/dev/null | head -n 1)
+          if [ -n "$APK_BIN" ] && ls /workdir/release_files/*.apk >/dev/null 2>&1; then
+            cd /workdir/pkg_extract
+            for f in /workdir/release_files/*.apk; do
+              "$APK_BIN" extract --allow-untrusted "$f"
+            done
+          fi
+
+          # 提取 .ipk 中的 .ko 与二进制文件 (适用于 OpenWrt / ImmortalWrt 24.10 及更早版本)
+          if ls /workdir/release_files/*.ipk >/dev/null 2>&1; then
+            cd /workdir/pkg_extract
+            for f in /workdir/release_files/*.ipk; do
+              mkdir -p tmp_ipk
+              tar -xzf "$f" -C tmp_ipk
+              tar -xzf tmp_ipk/data.tar.gz -C /workdir/pkg_extract
+              rm -rf tmp_ipk
+            done
+          fi
+
+          # 收集提取出来的内核模块与用户态可执行文件
+          find /workdir/pkg_extract -name "*.ko" -exec cp -v {} /workdir/release_files/ \;
+          find /workdir/pkg_extract -path "*/usr/bin/*" -type f -exec cp -v {} /workdir/release_files/ \;
+          find /workdir/pkg_extract -path "*/usr/sbin/*" -type f -exec cp -v {} /workdir/release_files/ \;
+
+          echo "=== 最终输出文件列表 ==="
+          ls -lh /workdir/release_files/
+
+      - name: Check output files
+        id: tag
+        run: |
+          if [ -n "$(ls -A /workdir/release_files 2>/dev/null)" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ 未找到编译产物 (.ipk / .apk)!"
+            exit 1
+          fi
+
+      - name: Upload Package to release
+        uses: softprops/action-gh-release@v2
+        if: steps.tag.outputs.status == 'success' && github.event.inputs.upload_release != false && !cancelled()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: ${{ steps.meta.outputs.release_tag }}
+          body: |
+            - **Distro**: `${{ github.event.inputs.distro || 'immortalwrt' }}`
+            - **Version**: `${{ github.event.inputs.version || '25.12.0' }}`
+            - **Target**: `${{ github.event.inputs.target == 'custom' && github.event.inputs.custom_target || (github.event.inputs.target || 'qualcommax/ipq807x') }}`
+            - **SDK**: `${{ steps.meta.outputs.sdk_file }}`
+          files: /workdir/release_files/*
