@@ -156,6 +156,9 @@ jobs:
       - name: Cross-compile user-space & kernel module (Official Guide Way)
         working-directory: /workdir
         run: |
+          # 补充安装宿主机 libzstd-dev（满足宿主机 bpftool 链接 libelf 依赖）
+          sudo apt-get -qq install -y libzstd-dev > /dev/null
+
           # 1. 定位 OpenWrt SDK 交叉编译工具链与内核源码目录
           TOOLCHAIN_DIR=$(find /workdir/openwrt/staging_dir -maxdepth 1 -type d -name "toolchain-*" | head -n 1)
           TARGET_DIR=$(find /workdir/openwrt/staging_dir -maxdepth 1 -type d -name "target-*" | head -n 1)
@@ -177,10 +180,6 @@ jobs:
           export STAGING_DIR="$TARGET_DIR"
           export PATH="${TOOLCHAIN_DIR}/bin:${PATH}"
 
-          echo "=== 检查仓库自带 toolchains 文件 ==="
-          ls -la /workdir/tutuicmptunnel/toolchains/ || true
-
-          # 2. 注入 sysroot 参数，防止子项目 libbpf 误读宿主机 /usr/include
           SYSROOT_FLAGS="--sysroot=${TOOLCHAIN_DIR} -I${TARGET_DIR}/usr/include -I${TOOLCHAIN_DIR}/include"
           LDFLAGS_FLAGS="--sysroot=${TOOLCHAIN_DIR} -L${TARGET_DIR}/usr/lib -L${TOOLCHAIN_DIR}/lib"
 
@@ -209,10 +208,13 @@ jobs:
             -DDISABLE_BPF_TIMER=0 \
             -DENABLE_XDP_INGRESS="$XDP_FLAG"
 
-          # 传入 EXTRA_CFLAGS 确保 ExternalProject 编译 libbpf 时也严格使用 musl sysroot
+          # 2. 阶段一：纯宿主机环境单独编译 bpftool（不传交叉编译 EXTRA_* 参数）
+          make -j$(nproc) build_bpftool
+
+          # 3. 阶段二：带目标机 musl sysroot 参数编译 libbpf 与用户态程序
           make -j$(nproc) EXTRA_CFLAGS="${SYSROOT_FLAGS}" EXTRA_LDFLAGS="${LDFLAGS_FLAGS}"
 
-          # 3. 收集并 strip 用户态二进制文件
+          # 4. 收集并 strip 用户态二进制文件
           for bin in tuctl tuctl_client tuctl_server tuserver; do
             if [ -f "$bin" ]; then
               "${CROSS_PREFIX}strip" "$bin" || true
@@ -220,7 +222,7 @@ jobs:
             fi
           done
 
-          # 4. 针对目标 SDK 内核树独立编译 tutu_csum_fixup.ko
+          # 5. 针对目标 SDK 内核树独立编译 tutu_csum_fixup.ko
           if [ -d "/workdir/tutuicmptunnel/tutu_csum_fixup" ] && [ -n "$LINUX_DIR" ]; then
             make -C "$LINUX_DIR" \
               ARCH="$KARCH" \
