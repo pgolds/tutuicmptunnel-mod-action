@@ -66,18 +66,26 @@ jobs:
       - name: Resolve build parameters & SDK URL
         id: meta
         run: |
-          DISTRO="${{ github.event.inputs.distro || 'immortalwrt' }}"
-          VERSION="${{ github.event.inputs.version || '25.12.0' }}"
-          TARGET="${{ github.event.inputs.target || 'qualcommax/ipq807x' }}"
+          DISTRO="${{ github.event.inputs.distro }}"
+          VERSION="${{ github.event.inputs.version }}"
+          TARGET="${{ github.event.inputs.target }}"
+
+          [ -z "$DISTRO" ] && DISTRO="immortalwrt"
+          [ -z "$VERSION" ] && VERSION="25.12.0"
+          [ -z "$TARGET" ] && TARGET="qualcommax/ipq807x"
 
           if [ "$TARGET" = "custom" ]; then
             TARGET="${{ github.event.inputs.custom_target }}"
           fi
 
-          if [ -z "$TARGET" ] \vert{}\vert{} [[ "$TARGET" != */* ]]; then
-            echo "❌ 错误: Target 格式必须为 <target>/<subtarget>，例如 x86/64 或 bcm27xx/bcm2711"
-            exit 1
-          fi
+          # 使用 case 校验 <target>/<subtarget> 格式，彻底避免括号转义问题
+          case "$TARGET" in
+            */*) ;;
+            *)
+              echo "❌ 错误: Target 格式必须为 <target>/<subtarget>，例如 x86/64 或 bcm27xx/bcm2711"
+              exit 1
+              ;;
+          esac
 
           if [ "$DISTRO" = "immortalwrt" ]; then
             BASE_HOST="https://downloads.immortalwrt.org"
@@ -85,7 +93,7 @@ jobs:
             BASE_HOST="https://downloads.openwrt.org"
           fi
 
-          if [ "${VERSION^^}" = "SNAPSHOT" ]; then
+          if [ "$VERSION" = "SNAPSHOT" ] || [ "$VERSION" = "snapshot" ]; then
             SDK_BASE_URL="${BASE_HOST}/snapshots/targets/${TARGET}/"
             VER_TAG="snapshot"
           else
@@ -94,14 +102,15 @@ jobs:
           fi
 
           echo "正在查询 SDK 目录: ${SDK_BASE_URL}"
-          SDK_FILE=$(curl -fsSL "$SDK_BASE_URL" \vert{} grep -oE "${DISTRO}-sdk-[^\"]*Linux-x86_64\.tar\.(zst|xz)" | head -n 1)
+          # 加上 -g 关闭 curl 的 {} URL 扩展解析，用 sed 提取 href 中的 SDK 文件名
+          SDK_FILE=$(curl -fsSLg "$SDK_BASE_URL" | sed -n "s/.*href=\"\(${DISTRO}-sdk-[^\"]*Linux-x86_64\.tar\.[xzst]*\)\".*/\1/p" | head -n 1)
 
           if [ -z "$SDK_FILE" ]; then
             echo "❌ 未能在 ${SDK_BASE_URL} 找到匹配的 SDK 文件，请核对版本号与架构拼写！"
             exit 1
           fi
 
-          SAFE_TARGET="${TARGET//\//-}"
+          SAFE_TARGET=$(echo "$TARGET" | tr '/' '-')
           RELEASE_TAG="${DISTRO}-${VER_TAG}-${SAFE_TARGET}-tutuicmptunnel-bpf"
 
           echo "sdk_url=${SDK_BASE_URL}${SDK_FILE}" >> $GITHUB_OUTPUT
