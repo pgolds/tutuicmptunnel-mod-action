@@ -191,6 +191,7 @@ jobs:
           mkdir -p /workdir/tutuicmptunnel/build /workdir/release_files /workdir/install_stage
           cd /workdir/tutuicmptunnel/build
 
+          # 1. CMake 配置阶段：关闭依赖 BTF 的 bpf_timer
           cmake .. \
             -DCMAKE_SYSTEM_NAME=Linux \
             -DCMAKE_SYSTEM_PROCESSOR="$TARGET_ARCH" \
@@ -208,7 +209,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DENABLE_HARDEN_MODE=1 \
             -DUSE_SYSTEM_LIBBPF_BPFTOOL=0 \
-            -DDISABLE_BPF_TIMER=0 \
+            -DDISABLE_BPF_TIMER=1 \
             -DENABLE_XDP_INGRESS="$XDP_FLAG"
 
           make -j$(nproc) build_bpftool
