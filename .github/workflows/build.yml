@@ -40,7 +40,7 @@ on:
         description: 'openwrt-tutuicmptunnel-kmod 分支或 Tag'
         required: false
         type: string
-        default: 'master'
+        default: ''
       upload_release:
         description: '自动上传到 GitHub Release'
         required: false
@@ -134,9 +134,13 @@ jobs:
           cd /workdir/openwrt
 
           # 直接从 GitHub 克隆 openwrt-tutuicmptunnel-kmod 源码到 package/tutuicmptunnel
-          git clone --depth 1 -b "${{ github.event.inputs.pkg_ref || 'master' }}" \
-            https://github.com/hrimfaxi/openwrt-tutuicmptunnel-kmod.git package/tutuicmptunnel
-
+          PKG_REF="${{ github.event.inputs.pkg_ref }}"
+          if [ -n "$PKG_REF" ]; then
+            git clone --depth 1 -b "$PKG_REF" https://github.com/hrimfaxi/openwrt-tutuicmptunnel-kmod.git package/tutuicmptunnel
+          else
+            git clone --depth 1 https://github.com/hrimfaxi/openwrt-tutuicmptunnel-kmod.git package/tutuicmptunnel
+          fi
+          
           echo "=== 确认 package/tutuicmptunnel 内容 ==="
           ls -la package/tutuicmptunnel
 
