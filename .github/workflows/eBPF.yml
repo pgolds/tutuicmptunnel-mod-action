@@ -161,12 +161,10 @@ jobs:
           TARGET_DIR=$(find /workdir/openwrt/staging_dir -maxdepth 1 -type d -name "target-*" | head -n 1)
           LINUX_DIR=$(find /workdir/openwrt/build_dir -maxdepth 3 -type d -name "linux-[0-9]*" | head -n 1)
 
-          # 自动识别交叉编译器前缀 (如 aarch64-openwrt-linux-musl-)
           CROSS_GCC=$(find "${TOOLCHAIN_DIR}/bin" -name "*-openwrt-linux*-gcc" | head -n 1)
           CROSS_PREFIX="${CROSS_GCC%gcc}"
           TARGET_ARCH=$(basename "$CROSS_PREFIX" | cut -d'-' -f1)
 
-          # 映射 Linux ARCH 变量
           case "$TARGET_ARCH" in
             aarch64*) KARCH="arm64" ;;
             arm*) KARCH="arm" ;;
@@ -179,12 +177,13 @@ jobs:
           export STAGING_DIR="$TARGET_DIR"
           export PATH="${TOOLCHAIN_DIR}/bin:${PATH}"
 
-          echo "TOOLCHAIN_DIR: $TOOLCHAIN_DIR"
-          echo "CROSS_PREFIX:  $CROSS_PREFIX"
-          echo "LINUX_DIR:     $LINUX_DIR"
-          echo "KARCH:         $KARCH"
+          echo "=== 检查仓库自带 toolchains 文件 ==="
+          ls -la /workdir/tutuicmptunnel/toolchains/ || true
 
-          # 2. 按官方方式：原生 CMake 独立交叉编译用户态程序（宿主机自动编译 host bpftool，目标机交叉编译 tuctl/tuserver）
+          # 2. 注入 sysroot 参数，防止子项目 libbpf 误读宿主机 /usr/include
+          SYSROOT_FLAGS="--sysroot=${TOOLCHAIN_DIR} -I${TARGET_DIR}/usr/include -I${TOOLCHAIN_DIR}/include"
+          LDFLAGS_FLAGS="--sysroot=${TOOLCHAIN_DIR} -L${TARGET_DIR}/usr/lib -L${TOOLCHAIN_DIR}/lib"
+
           XDP_FLAG="0"
           [ "${{ github.event.inputs.enable_xdp }}" = "true" ] && XDP_FLAG="1"
 
@@ -196,6 +195,10 @@ jobs:
             -DCMAKE_SYSTEM_PROCESSOR="$TARGET_ARCH" \
             -DCMAKE_C_COMPILER="${CROSS_PREFIX}gcc" \
             -DCMAKE_CXX_COMPILER="${CROSS_PREFIX}g++" \
+            -DCMAKE_SYSROOT="${TOOLCHAIN_DIR}" \
+            -DCMAKE_C_FLAGS="${SYSROOT_FLAGS}" \
+            -DCMAKE_CXX_FLAGS="${SYSROOT_FLAGS}" \
+            -DCMAKE_EXE_LINKER_FLAGS="${LDFLAGS_FLAGS}" \
             -DCMAKE_FIND_ROOT_PATH="${TARGET_DIR};${TOOLCHAIN_DIR}" \
             -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
             -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
@@ -206,9 +209,10 @@ jobs:
             -DDISABLE_BPF_TIMER=0 \
             -DENABLE_XDP_INGRESS="$XDP_FLAG"
 
-          make -j$(nproc)
+          # 传入 EXTRA_CFLAGS 确保 ExternalProject 编译 libbpf 时也严格使用 musl sysroot
+          make -j$(nproc) EXTRA_CFLAGS="${SYSROOT_FLAGS}" EXTRA_LDFLAGS="${LDFLAGS_FLAGS}"
 
-          # 复制编译好的用户态二进制文件（剥离调试符号减小体积）
+          # 3. 收集并 strip 用户态二进制文件
           for bin in tuctl tuctl_client tuctl_server tuserver; do
             if [ -f "$bin" ]; then
               "${CROSS_PREFIX}strip" "$bin" || true
@@ -216,7 +220,7 @@ jobs:
             fi
           done
 
-          # 3. 按官方方式：针对目标 SDK 内核树独立编译 tutu_csum_fixup.ko
+          # 4. 针对目标 SDK 内核树独立编译 tutu_csum_fixup.ko
           if [ -d "/workdir/tutuicmptunnel/tutu_csum_fixup" ] && [ -n "$LINUX_DIR" ]; then
             make -C "$LINUX_DIR" \
               ARCH="$KARCH" \
@@ -226,7 +230,6 @@ jobs:
             cp -v /workdir/tutuicmptunnel/tutu_csum_fixup/*.ko /workdir/release_files/
           fi
 
-          # 打包一个方便解压即用的 tar.gz 归档
           tar -czf "/workdir/release_files/${{ steps.meta.outputs.release_tag }}.tar.gz" -C /workdir/release_files .
 
           echo "=== 最终输出产物 ==="
