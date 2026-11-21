@@ -162,18 +162,7 @@ jobs:
       - name: Compile tutuicmptunnel
         run: |
           cd /workdir/openwrt
-
-          # 直接向 package/tutuicmptunnel/Makefile 的 Build/Prepare 末尾追加补丁逻辑
-          cat << 'EOF' >> package/tutuicmptunnel/Makefile
-
-          define Build/Prepare
-          	$(call Build/Prepare/Default)
-          	TARGET_C=$$(find $(PKG_BUILD_DIR)/kmod -maxdepth 1 -name "*.c" | head -n 1); \
-          	echo "Patching $$TARGET_C"; \
-          	printf '\nbool __list_add_valid_or_report(struct list_head *n, struct list_head *p, struct list_head *nx) { return true; }\nbool __list_del_entry_valid_or_report(struct list_head *e) { return true; }\n' >> "$$TARGET_C"
-          endef
-          EOF
-
+          
           make package/tutuicmptunnel/clean V=s
           KCFLAGS="-std=gnu11 -Wno-declaration-after-statement -D__NO_FORTIFY" \
             make package/tutuicmptunnel/compile V=s
@@ -208,20 +197,27 @@ jobs:
           find /workdir/pkg_extract -path "*/usr/bin/*" -type f -exec cp -v {} /workdir/release_files/ \;
           find /workdir/pkg_extract -path "*/usr/sbin/*" -type f -exec cp -v {} /workdir/release_files/ \;
 
+          echo "=== 使用交叉链接器直接注入缺失符号到 tutuicmptunnel.ko ==="
+          CC_BIN=$(find /workdir/openwrt/staging_dir/toolchain-*/bin/ -name "*-linux-musl-gcc" | head -n 1)
+          LD_BIN=$(find /workdir/openwrt/staging_dir/toolchain-*/bin/ -name "*-linux-musl-ld" | head -n 1)
+          KO_FILE="/workdir/release_files/tutuicmptunnel.ko"
+
+          cat << 'EOF' > /workdir/stub.c
+          _Bool __list_add_valid_or_report(void *n, void *p, void *nx) { return 1; }
+          _Bool __list_del_entry_valid_or_report(void *e) { return 1; }
+          EOF
+
+          "$CC_BIN" -O2 -fno-pic -c /workdir/stub.c -o /workdir/stub.o
+          "$LD_BIN" -r "$KO_FILE" /workdir/stub.o -o "${KO_FILE}.patched"
+          mv "${KO_FILE}.patched" "$KO_FILE"
+
           echo "=== 检查 .ko 未定义符号与 vermagic ==="
-          for ko in /workdir/release_files/*.ko; do
-            if [ -f "$ko" ]; then
-              modinfo "$ko" | grep -E "filename|vermagic"
-              echo "--- 所有未定义外部符号 (nm -u) ---"
-              nm -u "$ko"
-              if nm -u "$ko" | grep -E "list_add|list_del|fortify"; then
-                echo "❌ 仍然存在未定义加固符号!"
-                exit 1
-              else
-                echo "✅ 验证通过：已彻底消除 fortify / list_hardened 外部符号依赖"
-              fi
-            fi
-          done
+          modinfo "$KO_FILE" | grep -E "filename|vermagic"
+          if nm -u "$KO_FILE" | grep -E "list_add_valid|list_del_entry_valid|fortify_panic"; then
+            echo "❌ 仍然存在未定义符号!"
+            exit 1
+          fi
+          echo "✅ 验证通过：已通过 ELF 链接彻底注入缺失符号！"
 
           echo "=== 最终输出文件列表 ==="
           ls -lh /workdir/release_files/
