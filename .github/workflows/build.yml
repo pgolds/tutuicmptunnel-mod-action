@@ -163,32 +163,18 @@ jobs:
         run: |
           cd /workdir/openwrt
 
-          make package/tutuicmptunnel/clean V=s
-          make package/tutuicmptunnel/prepare V=s
+          # 直接向 package/tutuicmptunnel/Makefile 的 Build/Prepare 末尾追加补丁逻辑
+          cat << 'EOF' >> package/tutuicmptunnel/Makefile
 
-          TUTU_C=$(find build_dir/ -path "*/tutuicmptunnel-*/kmod/tutu.c" | head -n 1)
-          echo "=== 目标源码文件: $TUTU_C ==="
-          if [ -z "$TUTU_C" ]; then
-            echo "❌ 未找到 tutu.c"
-            exit 1
-          fi
-
-          cat << 'EOF' >> "$TUTU_C"
-
-          /* iStoreOS compatibility stubs */
-          bool __list_add_valid_or_report(struct list_head *new, struct list_head *prev, struct list_head *next)
-          {
-              return true;
-          }
-          EXPORT_SYMBOL(__list_add_valid_or_report);
-
-          bool __list_del_entry_valid_or_report(struct list_head *entry)
-          {
-              return true;
-          }
-          EXPORT_SYMBOL(__list_del_entry_valid_or_report);
+          define Build/Prepare
+          	$(call Build/Prepare/Default)
+          	TARGET_C=$$(find $(PKG_BUILD_DIR)/kmod -maxdepth 1 -name "*.c" | head -n 1); \
+          	echo "Patching $$TARGET_C"; \
+          	printf '\nbool __list_add_valid_or_report(struct list_head *n, struct list_head *p, struct list_head *nx) { return true; }\nbool __list_del_entry_valid_or_report(struct list_head *e) { return true; }\n' >> "$$TARGET_C"
+          endef
           EOF
-          
+
+          make package/tutuicmptunnel/clean V=s
           KCFLAGS="-std=gnu11 -Wno-declaration-after-statement -D__NO_FORTIFY" \
             make package/tutuicmptunnel/compile V=s
           # KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" \
