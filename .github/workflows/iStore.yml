@@ -67,15 +67,18 @@ jobs:
       - name: Clone iStoreOS source & update feeds
         working-directory: /workdir
         run: |
-          git clone --depth 1 -b "${{ steps.meta.outputs.branch }}" https://github.com openwrt
+          GH_HOST="https://github.com"
+          ISTORE_REPO="${GH_HOST}/istoreos/istoreos.git"
+          TUTU_REPO="${GH_HOST}/hrimfaxi/openwrt-tutuicmptunnel-kmod.git"
+
+          git clone --depth 1 -b "${{ steps.meta.outputs.branch }}" "$ISTORE_REPO" openwrt
           cd /workdir/openwrt
 
-          # 克隆 tutuicmptunnel 模块源码
           PKG_REF="${{ github.event.inputs.pkg_ref }}"
           if [ -n "$PKG_REF" ]; then
-            git clone --depth 1 -b "$PKG_REF" https://github.com package/tutuicmptunnel
+            git clone --depth 1 -b "$PKG_REF" "$TUTU_REPO" package/tutuicmptunnel
           else
-            git clone --depth 1 https://github.com package/tutuicmptunnel
+            git clone --depth 1 "$TUTU_REPO" package/tutuicmptunnel
           fi
 
           ./scripts/feeds update -a
