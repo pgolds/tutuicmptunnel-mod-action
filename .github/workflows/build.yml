@@ -46,6 +46,11 @@ on:
         required: false
         type: boolean
         default: true
+      disable_hardening:
+        description: '兼容 iStoreOS/第三方固件 (关闭 FORTIFY_SOURCE 与 LIST_HARDENED 符号依赖)'
+        required: false
+        type: boolean
+        default: true
 
 env:
   TZ: Asia/Shanghai
@@ -163,10 +168,20 @@ jobs:
         run: |
           cd /workdir/openwrt
 
+          if [ "${{ github.event.inputs.disable_hardening }}" != "false" ]; then
+            echo "=== 禁用 SDK 内核头文件中的 LIST_HARDENED / DEBUG_LIST / FORTIFY_SOURCE ==="
+            find build_dir/ -path "*/include/generated/autoconf.h" -o -path "*/include/config/auto.conf" | while read -r f; do
+              echo "Patching $f"
+              sed -i '/CONFIG_LIST_HARDENED/d' "$f"
+              sed -i '/CONFIG_DEBUG_LIST/d' "$f"
+              sed -i '/CONFIG_FORTIFY_SOURCE/d' "$f"
+            done
+          fi
+          
           make package/tutuicmptunnel/clean V=s
           # KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" \
           #  make package/tutuicmptunnel/compile V=s
-          KCFLAGS="-std=gnu11 -Wno-declaration-after-statement -UCONFIG_LIST_HARDENED -UCONFIG_DEBUG_LIST -UCONFIG_FORTIFY_SOURCE -D__NO_FORTIFY" \
+          KCFLAGS="-std=gnu11 -Wno-declaration-after-statement -D__NO_FORTIFY" \
             make package/tutuicmptunnel/compile V=s
 
 
