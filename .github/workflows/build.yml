@@ -164,8 +164,11 @@ jobs:
           cd /workdir/openwrt
 
           make package/tutuicmptunnel/clean V=s
-          KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" \
+          # KCFLAGS="-std=gnu11 -Wno-declaration-after-statement" \
+          #  make package/tutuicmptunnel/compile V=s
+          KCFLAGS="-std=gnu11 -Wno-declaration-after-statement -UCONFIG_LIST_HARDENED -UCONFIG_DEBUG_LIST -UCONFIG_FORTIFY_SOURCE -D__NO_FORTIFY" \
             make package/tutuicmptunnel/compile V=s
+
 
           mkdir -p /workdir/release_files /workdir/pkg_extract
           find bin/ -type f \( -name "*tutu*.ipk" -o -name "*tutu*.apk" \) -exec cp -v {} /workdir/release_files/ \;
