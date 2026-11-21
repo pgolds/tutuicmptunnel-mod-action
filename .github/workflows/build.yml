@@ -202,23 +202,6 @@ jobs:
           LD_BIN=$(find /workdir/openwrt/staging_dir/toolchain-*/bin/ -name "*-linux-musl-ld" | head -n 1)
           KO_FILE="/workdir/release_files/tutuicmptunnel.ko"
 
-          cat << 'EOF' > /workdir/stub.c
-          _Bool __list_add_valid_or_report(void *n, void *p, void *nx) { return 1; }
-          _Bool __list_del_entry_valid_or_report(void *e) { return 1; }
-          EOF
-
-          "$CC_BIN" -O2 -fno-pic -c /workdir/stub.c -o /workdir/stub.o
-          "$LD_BIN" -r "$KO_FILE" /workdir/stub.o -o "${KO_FILE}.patched"
-          mv "${KO_FILE}.patched" "$KO_FILE"
-
-          echo "=== 检查 .ko 未定义符号与 vermagic ==="
-          modinfo "$KO_FILE" | grep -E "filename|vermagic"
-          if nm -u "$KO_FILE" | grep -E "list_add_valid|list_del_entry_valid|fortify_panic"; then
-            echo "❌ 仍然存在未定义符号!"
-            exit 1
-          fi
-          echo "✅ 验证通过：已通过 ELF 链接彻底注入缺失符号！"
-
           echo "=== 最终输出文件列表 ==="
           ls -lh /workdir/release_files/
 
